@@ -132,3 +132,15 @@ class GuestUpgradeRequest(BaseModel):
     """Request model for upgrading guest sessions to user."""
     device_id: str
 
+
+class OnboardingUpdate(BaseModel):
+    """Request model for saving onboarding answers."""
+    answers: Dict[str, Any]
+
+
+class OnboardingRead(BaseModel):
+    """Response model for getting onboarding answers."""
+    answers: Optional[Dict[str, Any]] = None
+    completed: bool = False
+    completed_at: Optional[str] = None
+

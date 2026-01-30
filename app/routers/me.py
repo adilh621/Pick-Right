@@ -7,7 +7,7 @@ from app.db.session import get_db
 from app.core.auth import get_current_user
 from app.models.user import User
 from app.models.scan_session import ScanSession
-from app.schemas.user import MeRead, UserPreferencesUpdate, GuestUpgradeRequest
+from app.schemas.user import MeRead, UserPreferencesUpdate, GuestUpgradeRequest, OnboardingRead, OnboardingUpdate
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/me", tags=["me"])
@@ -187,4 +187,50 @@ def upgrade_guest(
     db.commit()
     
     return {"migrated_scan_sessions": len(guest_sessions)}
+
+
+@router.get("/onboarding", response_model=OnboardingRead)
+def get_onboarding(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Get the authenticated user's onboarding answers.
+    
+    Requires Bearer token in Authorization header.
+    """
+    return OnboardingRead(
+        answers=current_user.onboarding_preferences,
+        completed=current_user.onboarding_completed_at is not None,
+        completed_at=current_user.onboarding_completed_at.isoformat() if current_user.onboarding_completed_at else None
+    )
+
+
+@router.put("/onboarding")
+def update_onboarding(
+    request: OnboardingUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Save onboarding answers for the authenticated user.
+    
+    Requires Bearer token in Authorization header.
+    
+    Sets onboarding_completed = true and onboarding_completed_at = now().
+    """
+    now = datetime.now(timezone.utc)
+    
+    logger.info(f"Updating onboarding for user id={current_user.id}, answers_keys={list(request.answers.keys()) if request.answers else []}")
+    
+    current_user.onboarding_preferences = request.answers
+    current_user.onboarding_completed_at = now
+    current_user.updated_at = now
+    
+    db.commit()
+    db.refresh(current_user)
+    
+    logger.info(f"Onboarding saved for user id={current_user.id}")
+    
+    return {"ok": True}
 

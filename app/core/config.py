@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     # Debug flag for debug endpoint gating
     debug: bool = Field(default=False, alias="DEBUG")
     
+    # Google Maps API key for Places API proxy endpoints (optional)
+    google_maps_api_key: str | None = None
+    
+    # Gemini AI configuration (optional)
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-2.5-flash"
+    
     @property
     def supabase_jwks_url(self) -> str:
         """Derive JWKS URL from Supabase URL."""

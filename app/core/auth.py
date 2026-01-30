@@ -305,6 +305,36 @@ def get_current_identity(
     )
 
 
+def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False)),
+    db: Session = Depends(get_db)
+) -> User | None:
+    """
+    Get current user if authenticated, otherwise return None.
+    
+    Use this for endpoints that work for both guests and authenticated users.
+    """
+    if not credentials or not credentials.credentials:
+        return None
+    
+    try:
+        # Verify token and get claims
+        claims = verify_supabase_token(credentials.credentials)
+        uid = claims.get("sub")
+        if not uid:
+            return None
+        
+        # Look up user
+        user = db.query(User).filter(User.external_auth_uid == uid).first()
+        return user
+    except HTTPException:
+        # Invalid token - treat as guest
+        return None
+    except Exception as e:
+        logger.warning(f"Error in optional auth: {e}")
+        return None
+
+
 def get_current_user(
     identity: Identity = Depends(get_current_identity),
     db: Session = Depends(get_db)
