@@ -7,7 +7,14 @@ from app.db.session import get_db
 from app.core.auth import get_current_user
 from app.models.user import User
 from app.models.scan_session import ScanSession
-from app.schemas.user import MeRead, UserPreferencesUpdate, GuestUpgradeRequest, OnboardingRead, OnboardingUpdate
+from app.schemas.user import (
+    MeRead,
+    OnboardingPreferences,
+    UserPreferencesUpdate,
+    GuestUpgradeRequest,
+    OnboardingRead,
+    OnboardingUpdate,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/me", tags=["me"])
@@ -20,11 +27,10 @@ def get_me(
 ):
     """
     Get the authenticated user's profile.
-    
-    Requires Bearer token in Authorization header.
-    Creates user if it doesn't exist (first-time login).
+    User is resolved by auth (get_current_user); this route only reads,
+    never creates users.
     """
-    return current_user
+    return MeRead.model_validate(current_user)
 
 
 @router.put("/preferences", response_model=MeRead)
@@ -35,8 +41,7 @@ def update_preferences(
 ):
     """
     Update the authenticated user's onboarding preferences (supports partial updates).
-    
-    Requires Bearer token in Authorization header.
+    Always operates on the User returned by get_current_user; never creates new users.
     
     Supports partial updates:
     - Both `onboarding_preferences` and `onboarding_completed_at` are optional
@@ -80,13 +85,18 @@ def update_preferences(
     has_changes = False
     now = datetime.now(timezone.utc)
     
-    # Handle onboarding_preferences (partial update support)
+    # Handle onboarding_preferences (partial update support): normalize to canonical shape
     if preferences.onboarding_preferences is not None:
-        current_user.onboarding_preferences = preferences.onboarding_preferences
+        existing = current_user.onboarding_preferences or {}
+        if isinstance(existing, dict):
+            merged = {**existing, **preferences.onboarding_preferences}
+        else:
+            merged = preferences.onboarding_preferences
+        canonical = OnboardingPreferences.model_validate(merged)
+        current_user.onboarding_preferences = canonical.model_dump(exclude_none=True)
         has_changes = True
-        prefs_keys = list(preferences.onboarding_preferences.keys())
-        prefs_size = len(str(preferences.onboarding_preferences))
-        logger.info(f"Updating onboarding_preferences: keys={prefs_keys}, size={prefs_size} bytes")
+        prefs_keys = list(current_user.onboarding_preferences.keys())
+        logger.info(f"Updating onboarding_preferences (canonical): keys={prefs_keys}")
     
     # Handle onboarding_completed_at (partial update support)
     if preferences.onboarding_completed_at is not None:
@@ -196,8 +206,7 @@ def get_onboarding(
 ):
     """
     Get the authenticated user's onboarding answers.
-    
-    Requires Bearer token in Authorization header.
+    Reads from the User instance returned by auth; no user creation here.
     """
     return OnboardingRead(
         answers=current_user.onboarding_preferences,
@@ -206,7 +215,7 @@ def get_onboarding(
     )
 
 
-@router.put("/onboarding")
+@router.put("/onboarding", response_model=MeRead)
 def update_onboarding(
     request: OnboardingUpdate,
     current_user: User = Depends(get_current_user),
@@ -214,23 +223,23 @@ def update_onboarding(
 ):
     """
     Save onboarding answers for the authenticated user.
-    
-    Requires Bearer token in Authorization header.
-    
-    Sets onboarding_completed = true and onboarding_completed_at = now().
+    Works even if preferences are currently NULL. Overwrites onboarding_preferences
+    with the request payload and always sets onboarding_completed_at to now.
     """
     now = datetime.now(timezone.utc)
-    
+
     logger.info(f"Updating onboarding for user id={current_user.id}, answers_keys={list(request.answers.keys()) if request.answers else []}")
-    
-    current_user.onboarding_preferences = request.answers
+
+    canonical = OnboardingPreferences.model_validate(request.answers)
+    current_user.onboarding_preferences = canonical.model_dump(exclude_none=True)
     current_user.onboarding_completed_at = now
     current_user.updated_at = now
-    
+
+    db.add(current_user)
     db.commit()
     db.refresh(current_user)
-    
+
     logger.info(f"Onboarding saved for user id={current_user.id}")
-    
-    return {"ok": True}
+
+    return MeRead.model_validate(current_user)
 

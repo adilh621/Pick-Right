@@ -1,9 +1,11 @@
 import logging
 import time
+import uuid as uuid_lib
 from typing import Optional, Dict, Any
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 import httpx
 from jose import jwt, jwk
@@ -14,6 +16,15 @@ from app.models.user import User
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def require_onboarding(user: User) -> None:
+    """Raise 409 if user has not completed onboarding (onboarding_completed_at is source of truth)."""
+    if user.onboarding_completed_at is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Onboarding incomplete. Please finish onboarding."
+        )
 
 # Security scheme for Bearer token
 security = HTTPBearer()
@@ -135,6 +146,70 @@ class Identity(BaseModel):
     provider: str
     uid: str
     email: Optional[str] = None
+
+
+def _normalize_supabase_uid(uid: uuid_lib.UUID | str) -> uuid_lib.UUID:
+    """Normalize Supabase UID (JWT sub) to uuid.UUID for storage/lookup."""
+    if isinstance(uid, uuid_lib.UUID):
+        return uid
+    try:
+        return uuid_lib.UUID(str(uid))
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid external_auth_uid format: {uid!r} -> {e}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid subject (sub) claim in token"
+        )
+
+
+def get_or_create_user_for_supabase_uid(
+    db: Session,
+    *,
+    external_auth_uid: str,
+    external_auth_provider: str | None = None,
+    email: str | None = None,
+) -> User:
+    """
+    Get existing user by Supabase UID (JWT sub), or create one if none exists.
+    Idempotent: concurrent /me requests for the same UID resolve to the same row.
+    On duplicate key (race), re-queries and returns the existing user.
+    """
+    uid_str = str(external_auth_uid)
+    user = db.query(User).filter(User.external_auth_uid == uid_str).first()
+    if user:
+        # Optional: backfill email/provider if missing on row but provided in args
+        was_updated = False
+        if email is not None and user.email is None:
+            user.email = email
+            was_updated = True
+        if external_auth_provider is not None and user.external_auth_provider is None:
+            user.external_auth_provider = external_auth_provider
+            was_updated = True
+        if was_updated:
+            db.commit()
+            db.refresh(user)
+        return user
+    # Create new user
+    logger.info(
+        f"Creating new user for external_auth_uid={uid_str}, provider={external_auth_provider}, email={email}"
+    )
+    user = User(
+        external_auth_uid=uid_str,
+        external_auth_provider=external_auth_provider or "email",
+        email=email,
+    )
+    db.add(user)
+    try:
+        db.commit()
+        db.refresh(user)
+        logger.info(f"Created user: id={user.id}, external_auth_uid={user.external_auth_uid}")
+        return user
+    except IntegrityError:
+        db.rollback()
+        user = db.query(User).filter(User.external_auth_uid == uid_str).first()
+        if user is not None:
+            return user
+        raise
 
 
 def verify_supabase_token(token: str) -> dict:
@@ -311,24 +386,19 @@ def get_current_user_optional(
 ) -> User | None:
     """
     Get current user if authenticated, otherwise return None.
-    
-    Use this for endpoints that work for both guests and authenticated users.
+    Does not create users; use for endpoints that work for both guests and authenticated users.
     """
     if not credentials or not credentials.credentials:
         return None
-    
     try:
-        # Verify token and get claims
         claims = verify_supabase_token(credentials.credentials)
         uid = claims.get("sub")
         if not uid:
             return None
-        
-        # Look up user
-        user = db.query(User).filter(User.external_auth_uid == uid).first()
+        uid_str = str(_normalize_supabase_uid(uid))
+        user = db.query(User).filter(User.external_auth_uid == uid_str).first()
         return user
     except HTTPException:
-        # Invalid token - treat as guest
         return None
     except Exception as e:
         logger.warning(f"Error in optional auth: {e}")
@@ -340,52 +410,14 @@ def get_current_user(
     db: Session = Depends(get_db)
 ) -> User:
     """
-    Get or create user based on external auth identity (idempotent).
-    
-    Looks up user by external_auth_uid. If not found, creates a new user
-    with email and provider information. Ensures all required fields are set.
-    
-    Args:
-        identity: Identity from token
-        db: Database session
-        
-    Returns:
-        User model instance
+    Get or create user for the authenticated Supabase identity (strict 1:1).
+    Validates JWT, then calls get_or_create_user_for_supabase_uid so the same
+    Supabase account always maps to the same public.users row.
     """
-    # Look up user by external_auth_uid (should match Supabase "sub")
-    user = db.query(User).filter(
-        User.external_auth_uid == identity.uid
-    ).first()
-    
-    if not user:
-        # Create new user with external auth info
-        logger.info(f"Creating new user for external_auth_uid={identity.uid}, provider={identity.provider}, email={identity.email}")
-        user = User(
-            external_auth_provider=identity.provider or "email",
-            external_auth_uid=identity.uid,
-            email=identity.email  # Set email from JWT
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        logger.info(f"Created user: id={user.id}, external_auth_uid={user.external_auth_uid}")
-    else:
-        # User exists - update email if we have it and user doesn't
-        was_updated = False
-        if identity.email and not user.email:
-            logger.info(f"Updating email for existing user id={user.id}, external_auth_uid={identity.uid}")
-            user.email = identity.email
-            was_updated = True
-        
-        # Update provider if missing
-        if not user.external_auth_provider and identity.provider:
-            logger.info(f"Updating provider for existing user id={user.id}, provider={identity.provider}")
-            user.external_auth_provider = identity.provider
-            was_updated = True
-        
-        if was_updated:
-            db.commit()
-            db.refresh(user)
-    
-    return user
+    return get_or_create_user_for_supabase_uid(
+        db,
+        external_auth_uid=identity.uid,
+        external_auth_provider=identity.provider or None,
+        email=identity.email,
+    )
 

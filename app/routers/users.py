@@ -11,17 +11,26 @@ from app.schemas.scan_session import ScanSessionRead
 router = APIRouter(prefix="/users", tags=["users"])
 
 
+def _normalize_uid(uid: UUID | str) -> str:
+    if isinstance(uid, UUID):
+        return str(uid)
+    return str(UUID(str(uid)))
+
+
 @router.post("", response_model=UserRead, status_code=201)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    """Create a new user."""
-    # Check if user with email or auth_provider_id already exists
-    existing_user = db.query(User).filter(
-        (User.email == user.email) | (User.auth_provider_id == user.auth_provider_id)
+    """Create a new user (programmatic only). Prefer auth flow for real users."""
+    uid_str = _normalize_uid(user.external_auth_uid)
+    existing = db.query(User).filter(
+        (User.external_auth_uid == uid_str)
+        | (User.email == user.email)
+        | (User.auth_provider_id == user.auth_provider_id)
     ).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="User with this email or auth_provider_id already exists")
-    
-    db_user = User(**user.model_dump())
+    if existing:
+        raise HTTPException(status_code=400, detail="User with this external_auth_uid, email or auth_provider_id already exists")
+    data = user.model_dump()
+    data["external_auth_uid"] = uid_str
+    db_user = User(**data)
     db.add(db_user)
     db.commit()
     db.refresh(db_user)

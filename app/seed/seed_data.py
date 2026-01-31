@@ -19,16 +19,18 @@ def seed_db(db: Session) -> None:
     db.query(User).delete()
     db.commit()
     
-    # Create Users
+    # Create Users (external_auth_uid required; 1:1 with Supabase auth)
     user1 = User(
         id=uuid.uuid4(),
+        external_auth_uid="11111111-1111-1111-1111-111111111111",
         auth_provider_id="supabase_user_1",
-        email="alice@example.com"
+        email="alice@example.com",
     )
     user2 = User(
         id=uuid.uuid4(),
+        external_auth_uid="22222222-2222-2222-2222-222222222222",
         auth_provider_id="supabase_user_2",
-        email="bob@example.com"
+        email="bob@example.com",
     )
     db.add(user1)
     db.add(user2)

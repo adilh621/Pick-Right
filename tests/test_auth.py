@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.backends import default_backend
 
-from app.core.auth import verify_supabase_token, get_current_identity, get_jwks_client
+from app.core.auth import verify_supabase_token, get_current_identity
 from app.core.config import settings
 
 
@@ -128,17 +128,6 @@ def create_test_token(
     return pyjwt.encode(claims, private_pem, algorithm="RS256", headers=headers)
 
 
-@pytest.fixture(autouse=True)
-def reset_jwks_client():
-    """Reset JWKS client before each test."""
-    from app.core.auth import _jwks_client
-    # Reset the global client
-    import app.core.auth
-    app.core.auth._jwks_client = None
-    yield
-    app.core.auth._jwks_client = None
-
-
 @pytest.fixture
 def mock_jwks_response():
     """Create a mock JWKS response."""
@@ -148,21 +137,9 @@ def mock_jwks_response():
 
 def test_verify_valid_token(mock_jwks_response):
     """Test verification of a valid token."""
-    from unittest.mock import Mock
-    
     token = create_test_token(_test_private_key)
-    
-    # Create a mock signing key object
-    mock_signing_key = Mock()
-    mock_signing_key.key = _test_public_pem.decode('utf-8') if isinstance(_test_public_pem, bytes) else _test_public_pem
-    
-    # Mock PyJWKClient
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.return_value = mock_signing_key
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
+    with patch("app.core.auth.fetch_jwks", return_value=mock_jwks_response):
         claims = verify_supabase_token(token)
-        
         assert claims["sub"] == "test-user-123"
         assert claims["email"] == "test@example.com"
 
@@ -189,117 +166,62 @@ def test_verify_token_missing_kid(mock_jwks_response):
     # Reconstruct token (this will have invalid signature, but we test kid first)
     invalid_token = f"{header_b64}.{parts[1]}.{parts[2]}"
     
-    # Mock PyJWKClient to raise an error when kid is missing
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.side_effect = Exception("Key ID not found")
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
-        with pytest.raises(Exception):  # Should fail when trying to get kid
+    with patch("app.core.auth.fetch_jwks", side_effect=Exception("Key ID not found")):
+        with pytest.raises(Exception):
             verify_supabase_token(invalid_token)
 
 
 def test_verify_token_wrong_issuer(mock_jwks_response):
     """Test that token with wrong issuer is rejected."""
-    from unittest.mock import Mock
-    
     token = create_test_token(
         _test_private_key,
         iss="https://wrong-issuer.com/auth/v1"
     )
-    
-    # Create a mock signing key object
-    mock_signing_key = Mock()
-    mock_signing_key.key = _test_public_pem.decode('utf-8') if isinstance(_test_public_pem, bytes) else _test_public_pem
-    
-    # Mock PyJWKClient
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.return_value = mock_signing_key
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
-        with pytest.raises(Exception):  # Should raise HTTPException
+    with patch("app.core.auth.fetch_jwks", return_value=mock_jwks_response):
+        with pytest.raises(Exception):
             verify_supabase_token(token)
 
 
 def test_verify_token_wrong_audience(mock_jwks_response):
     """Test that token with wrong audience is rejected."""
-    from unittest.mock import Mock
-    
     token = create_test_token(
         _test_private_key,
         aud="wrong-audience"
     )
-    
-    # Create a mock signing key object
-    mock_signing_key = Mock()
-    mock_signing_key.key = _test_public_pem.decode('utf-8') if isinstance(_test_public_pem, bytes) else _test_public_pem
-    
-    # Mock PyJWKClient
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.return_value = mock_signing_key
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
-        with pytest.raises(Exception):  # Should raise HTTPException
+    with patch("app.core.auth.fetch_jwks", return_value=mock_jwks_response):
+        with pytest.raises(Exception):
             verify_supabase_token(token)
 
 
 def test_verify_token_expired(mock_jwks_response):
     """Test that expired token is rejected."""
-    from unittest.mock import Mock
-    
-    # Create token that expired 1 hour ago
     exp = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())
     token = create_test_token(_test_private_key, exp=exp)
-    
-    # Create a mock signing key object
-    mock_signing_key = Mock()
-    mock_signing_key.key = _test_public_pem.decode('utf-8') if isinstance(_test_public_pem, bytes) else _test_public_pem
-    
-    # Mock PyJWKClient
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.return_value = mock_signing_key
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
-        with pytest.raises(Exception):  # Should raise HTTPException
+    with patch("app.core.auth.fetch_jwks", return_value=mock_jwks_response):
+        with pytest.raises(Exception):
             verify_supabase_token(token)
 
 
-def test_verify_token_key_not_in_jwks():
+def test_verify_token_key_not_in_jwks(mock_jwks_response):
     """Test that token with key ID not in JWKS is rejected."""
-    from unittest.mock import Mock
-    
     token = create_test_token(_test_private_key, kid="non-existent-key-id")
-    
-    # Mock PyJWKClient to raise an error when key is not found
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.side_effect = Exception("Key not found")
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
-        with pytest.raises(Exception):  # Should raise HTTPException
+    # JWKS has kid=test-key-id; token has different kid so get_signing_key will not find it
+    with patch("app.core.auth.fetch_jwks", return_value=mock_jwks_response):
+        with pytest.raises(Exception):
             verify_supabase_token(token)
 
 
 def test_get_current_identity_extracts_claims(mock_jwks_response):
     """Test that get_current_identity extracts claims correctly."""
     from fastapi.security import HTTPAuthorizationCredentials
-    from unittest.mock import Mock
-    
+
     token = create_test_token(_test_private_key, sub="user-456", email="user@test.com")
     credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-    
-    # Create a mock signing key object
-    mock_signing_key = Mock()
-    mock_signing_key.key = _test_public_pem.decode('utf-8') if isinstance(_test_public_pem, bytes) else _test_public_pem
-    
-    # Mock PyJWKClient
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.return_value = mock_signing_key
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
+    with patch("app.core.auth.fetch_jwks", return_value=mock_jwks_response):
         identity = get_current_identity(credentials)
-        
         assert identity.uid == "user-456"
         assert identity.email == "user@test.com"
-        assert identity.provider == "supabase"  # Default provider
+        assert identity.provider == "email"  # Default when app_metadata.provider not set
 
 
 def test_get_current_identity_missing_token():

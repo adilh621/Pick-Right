@@ -1,10 +1,46 @@
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator, model_serializer
 from uuid import UUID
 from datetime import datetime
-from typing import Optional, Dict, Any, TYPE_CHECKING
+from typing import Optional, Dict, Any, Union, List, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.schemas.scan_session import ScanSessionRead
+
+
+class OnboardingPreferences(BaseModel):
+    """
+    Canonical schema for onboarding_preferences.
+    Used for GET /me response, PUT /me/preferences payload, and PUT /me/onboarding.
+    Accepts legacy keys on input (intent_selections → intents, priority_selections → priorities);
+    output always uses canonical keys only (intents, priorities).
+    """
+    companion: Optional[str] = None
+    intents: Optional[List[str]] = None
+    priorities: Optional[List[str]] = None
+    place_interests: Optional[List[str]] = None
+    travel_frequency: Optional[str] = None
+    exploration_level: Optional[float] = None
+    dietary_restrictions: Optional[List[str]] = None
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def map_legacy_keys(cls, data: Any) -> Any:
+        """Map legacy keys to canonical: intent_selections → intents, priority_selections → priorities."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if data.get("intents") is None and data.get("intent_selections") is not None:
+            data["intents"] = data["intent_selections"]
+        if data.get("priorities") is None and data.get("priority_selections") is not None:
+            data["priorities"] = data["priority_selections"]
+        return data
+
+    @model_serializer
+    def _serialize_exclude_none(self):
+        """Emit only set fields; never include legacy keys (they are not model fields)."""
+        return {k: getattr(self, k) for k in self.model_fields if getattr(self, k) is not None}
 
 
 class UserBase(BaseModel):
@@ -13,7 +49,8 @@ class UserBase(BaseModel):
 
 
 class UserCreate(UserBase):
-    pass
+    """For programmatic/create-user API only. Auth flow uses get_or_create_user_for_supabase_uid."""
+    external_auth_uid: Union[str, UUID]  # Required; 1:1 with Supabase JWT sub
 
 
 class UserUpdate(BaseModel):
@@ -24,16 +61,23 @@ class UserUpdate(BaseModel):
 class UserRead(BaseModel):
     id: UUID
     external_auth_provider: Optional[str] = None
-    external_auth_uid: Optional[str] = None
-    onboarding_preferences: Optional[Dict[str, Any]] = None
+    external_auth_uid: Optional[Union[str, UUID]] = None  # JWT sub; UUID in DB, str in API
+    onboarding_preferences: Optional[OnboardingPreferences] = None
     onboarding_completed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     # Legacy fields (for backward compatibility)
     auth_provider_id: Optional[str] = None
     email: Optional[str] = None
+    needs_onboarding: bool = False
 
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="after")
+    def set_needs_onboarding(self) -> "UserRead":
+        """needs_onboarding is True iff onboarding_completed_at is NULL (source of truth for iOS)."""
+        self.needs_onboarding = self.onboarding_completed_at is None
+        return self
 
 
 class UserReadWithSessions(UserRead):

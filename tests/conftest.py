@@ -42,6 +42,13 @@ if not original_visit_JSONB:
     def visit_JSONB(self, type_, **kw):
         return "JSON"
     sqlite_base.SQLiteTypeCompiler.visit_JSONB = visit_JSONB
+
+# Monkey-patch postgresql.UUID to work with SQLite (store as CHAR(36))
+if not getattr(sqlite_base.SQLiteTypeCompiler, 'visit_UUID', None):
+    def visit_UUID(self, type_, **kw):
+        return "CHAR(36)"
+    sqlite_base.SQLiteTypeCompiler.visit_UUID = visit_UUID
+
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -169,34 +176,24 @@ def _create_test_token(
     return pyjwt.encode(claims, private_pem, algorithm="RS256", headers=headers)
 
 
+# Default test Supabase UIDs (valid UUIDs for external_auth_uid)
+TEST_SUPABASE_UID_1 = "550e8400-e29b-41d4-a716-446655440000"
+TEST_SUPABASE_UID_2 = "550e8400-e29b-41d4-a716-446655440001"
+TEST_SUPABASE_UID_3 = "550e8400-e29b-41d4-a716-446655440002"
+
+
 @pytest.fixture
 def mock_jwks():
-    """Fixture that mocks PyJWKClient for all tests."""
-    from unittest.mock import Mock
-    
-    # Get public key PEM
-    public_pem = _test_public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    public_pem_str = public_pem.decode('utf-8') if isinstance(public_pem, bytes) else public_pem
-    
-    # Create a mock signing key object
-    mock_signing_key = Mock()
-    mock_signing_key.key = public_pem_str
-    
-    # Mock PyJWKClient
-    mock_jwks_client = Mock()
-    mock_jwks_client.get_signing_key_from_jwt.return_value = mock_signing_key
-    
-    with patch('app.core.auth.get_jwks_client', return_value=mock_jwks_client):
-        yield mock_jwks_client
+    """Fixture that mocks JWKS so JWT verification uses the test key."""
+    test_jwks = _create_test_jwks(_test_public_key)
+    with patch("app.core.auth.fetch_jwks", return_value=test_jwks):
+        yield test_jwks
 
 
 @pytest.fixture
 def create_test_token():
-    """Fixture that provides a function to create test JWT tokens."""
-    def _create(sub="test-user-123", email="test@example.com", **kwargs):
+    """Fixture that provides a function to create test JWT tokens. sub must be a valid UUID."""
+    def _create(sub=TEST_SUPABASE_UID_1, email="test@example.com", **kwargs):
         return _create_test_token(_test_private_key, sub=sub, email=email, **kwargs)
     return _create
 

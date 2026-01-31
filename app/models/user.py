@@ -13,9 +13,15 @@ class User(Base):
     # Legacy fields (kept for backward compatibility during migration)
     auth_provider_id = Column(String, unique=True, nullable=True, index=True)
     email = Column(String, unique=True, nullable=True, index=True)
-    # New external auth fields
-    external_auth_provider = Column(String, nullable=True)  # e.g., "firebase", "supabase", "clerk"
-    external_auth_uid = Column(String, unique=True, nullable=True, index=True)
+    # External auth: 1:1 with Supabase auth.users (JWT sub). String in model for SQLite compat; migration uses UUID on PostgreSQL.
+    external_auth_provider = Column(String, nullable=True)  # e.g. "google", "email"
+    external_auth_uid = Column(
+        String(36),
+        unique=True,
+        nullable=False,
+        index=True,
+        name="external_auth_uid",
+    )
     # Onboarding fields
     onboarding_preferences = Column(JSONB, nullable=True)
     onboarding_completed_at = Column(DateTime(timezone=True), nullable=True)
