@@ -1,11 +1,19 @@
 """Gemini AI client service."""
 
 import logging
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 from google import genai
+from google.genai import errors as genai_errors
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+# Cooldown after 429 RESOURCE_EXHAUSTED; skip all Gemini calls until this time
+_quota_cooldown_until: Optional[datetime] = None
 
 # System instruction for PickRight AI (original, used by /ai/hello)
 SYSTEM_INSTRUCTION = "You are PickRight, helpful and concise. Return markdown."
@@ -20,6 +28,58 @@ IMPORTANT RULES:
 - Be helpful but honest about what you don't know."""
 
 
+def _is_quota_error(exc: BaseException) -> bool:
+    """True if the exception is a 429 / RESOURCE_EXHAUSTED from the Gemini API."""
+    if not isinstance(exc, genai_errors.ClientError):
+        return False
+    if getattr(exc, "code", None) == 429:
+        return True
+    status = getattr(exc, "status", None)
+    if status and "RESOURCE_EXHAUSTED" in str(status).upper():
+        return True
+    return False
+
+
+def _extract_retry_delay_seconds(exc: BaseException) -> Optional[int]:
+    """
+    Parse RetryInfo from error details if present.
+    Returns delay in seconds, or None if not found.
+    """
+    details = getattr(exc, "details", None)
+    if not details or not isinstance(details, dict):
+        return None
+    # details might be the full error object with nested "error" or a "details" list
+    err = details.get("error", details)
+    if not isinstance(err, dict):
+        return None
+    raw_list = err.get("details") if isinstance(err.get("details"), list) else None
+    if not raw_list:
+        return None
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        if item.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
+            delay_str = item.get("retryDelay")
+            if delay_str is None:
+                continue
+            # Format is often "34s" or "60.123s"
+            match = re.match(r"^(\d+(?:\.\d+)?)\s*s", str(delay_str).strip())
+            if match:
+                return int(float(match.group(1)))
+    return None
+
+
+def _should_skip_due_to_quota() -> bool:
+    """True if we are still in the quota cooldown window."""
+    global _quota_cooldown_until
+    if _quota_cooldown_until is None:
+        return False
+    if datetime.now(timezone.utc) >= _quota_cooldown_until:
+        _quota_cooldown_until = None
+        return False
+    return True
+
+
 def _get_client() -> genai.Client:
     """Get Gemini client, raising error if API key not configured."""
     if not settings.gemini_api_key:
@@ -27,53 +87,72 @@ def _get_client() -> genai.Client:
     return genai.Client(api_key=settings.gemini_api_key)
 
 
-def generate_text(prompt: str) -> str:
+def generate_text(prompt: str) -> Optional[str]:
     """
     Generate text using Gemini model (original system instruction).
-    
+
     Args:
         prompt: The user prompt to send to the model.
-        
+
     Returns:
-        The generated text response.
-        
-    Raises:
-        ValueError: If GEMINI_API_KEY is not configured.
-        Exception: If the API call fails.
+        The generated text response, or None on quota/cooldown or transient failure.
     """
     return generate_text_with_system(prompt, SYSTEM_INSTRUCTION)
 
 
-def generate_text_with_system(prompt: str, system_instruction: str) -> str:
+def generate_text_with_system(prompt: str, system_instruction: str) -> Optional[str]:
     """
     Generate text using Gemini model with custom system instruction.
-    
+
+    On 429 RESOURCE_EXHAUSTED, sets a module-level cooldown and returns None.
+    During cooldown, skips the SDK call and returns None.
+
     Args:
         prompt: The user prompt to send to the model.
         system_instruction: Custom system instruction for the model.
-        
-    Returns:
-        The generated text response.
-        
-    Raises:
-        ValueError: If GEMINI_API_KEY is not configured.
-        Exception: If the API call fails.
-    """
-    client = _get_client()
-    model = settings.gemini_model
-    
-    logger.info(f"Calling Gemini model={model}, prompt_length={len(prompt)}")
-    
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=system_instruction,
-        ),
-    )
-    
-    result = response.text
-    logger.info(f"Gemini response_length={len(result) if result else 0}")
-    
-    return result
 
+    Returns:
+        The generated text response, or None on quota exceeded, during cooldown,
+        or if the API returns empty.
+    """
+    global _quota_cooldown_until
+
+    if _should_skip_due_to_quota():
+        logger.debug(
+            "Skipping Gemini call due to recent quota exceeded; still in cooldown"
+        )
+        return None
+
+    try:
+        client = _get_client()
+        model = settings.gemini_model
+
+        logger.info("Calling Gemini model=%s, prompt_length=%s", model, len(prompt))
+
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_instruction,
+            ),
+        )
+
+        result = response.text
+        logger.info(
+            "Gemini response_length=%s",
+            len(result) if result else 0,
+        )
+        return result
+
+    except genai_errors.ClientError as e:
+        if _is_quota_error(e):
+            retry_sec = _extract_retry_delay_seconds(e)
+            cooldown_sec = retry_sec if retry_sec is not None else settings.gemini_quota_cooldown_seconds
+            _quota_cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=cooldown_sec)
+            logger.warning(
+                "Gemini quota exceeded (429 RESOURCE_EXHAUSTED); cooldown %s s. retryDelay=%s",
+                cooldown_sec,
+                retry_sec,
+            )
+            return None
+        raise

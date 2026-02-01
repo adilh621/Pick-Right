@@ -31,4 +31,7 @@ class User(Base):
 
     # Relationships
     scan_sessions = relationship("ScanSession", back_populates="user", cascade="all, delete-orphan")
+    business_chat_messages = relationship(
+        "BusinessChatMessage", back_populates="user", cascade="all, delete-orphan"
+    )
 

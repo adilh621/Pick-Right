@@ -42,7 +42,8 @@ def seed_db(db: Session) -> None:
     business1 = Business(
         id=uuid.uuid4(),
         name="Tony's Pizza",
-        external_id_yelp="tonys-pizza-nyc",
+        provider="google",
+        provider_place_id="ChIJ123456789",
         external_id_google="ChIJ123456789",
         address_full="123 Main St, New York, NY 10001",
         lat=40.7128,
@@ -52,7 +53,8 @@ def seed_db(db: Session) -> None:
     business2 = Business(
         id=uuid.uuid4(),
         name="Elite Hair Salon",
-        external_id_yelp="elite-hair-salon",
+        provider="google",
+        provider_place_id="ChIJ987654321",
         external_id_google="ChIJ987654321",
         address_full="456 Broadway, New York, NY 10013",
         lat=40.7209,

@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     # Gemini AI configuration (optional)
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
+    # Cooldown in seconds after 429 RESOURCE_EXHAUSTED; used when RetryInfo not present
+    gemini_quota_cooldown_seconds: int = 60
     
     @property
     def supabase_jwks_url(self) -> str:

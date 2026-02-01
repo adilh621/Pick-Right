@@ -1,16 +1,22 @@
 """Google Places API proxy endpoints."""
 
 import logging
-import traceback
 import re
+import traceback
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 import httpx
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.auth import get_current_user, require_onboarding
+from app.db.session import get_db
 from app.models.user import User
+from app.models.business import Business
+from app.services.ai_notes_service import generate_ai_notes_for_business
+from app.ai.business_context import generate_business_ai_context
 import math
 
 from app.schemas.places import (
@@ -59,6 +65,14 @@ def _build_photo_url(photo_reference: str | None, max_width: int = 1200) -> str 
         f"&photo_reference={photo_reference}"
         f"&key={api_key}"
     )
+
+
+def _extract_state_from_address_components(place: dict) -> str | None:
+    """Extract state/region from Google Place address_components (administrative_area_level_1)."""
+    for comp in place.get("address_components") or []:
+        if "administrative_area_level_1" in (comp.get("types") or []):
+            return comp.get("long_name") or comp.get("short_name")
+    return None
 
 
 def _extract_primary_type(place: dict) -> str | None:
@@ -170,8 +184,13 @@ def _normalize_opening_hours(hours_data: dict | None) -> OpeningHours | None:
     )
 
 
-def _normalize_place_details(place: dict) -> PlaceDetails:
-    """Normalize Google place details to our schema."""
+def _normalize_place_details(
+    place: dict,
+    ai_notes: str | None = None,
+    business_id: Business | None = None,
+    ai_context: dict | None = None,
+) -> PlaceDetails:
+    """Normalize Google place details to our schema. Optionally attach cached ai_notes, business_id, ai_context."""
     location = place.get("geometry", {}).get("location", {})
     photos = place.get("photos", [])
     
@@ -204,6 +223,9 @@ def _normalize_place_details(place: dict) -> PlaceDetails:
         photo_urls=photo_urls,
         lat=location.get("lat"),
         lng=location.get("lng"),
+        ai_notes=ai_notes,
+        business_id=business_id.id if business_id else None,
+        ai_context=ai_context,
     )
 
 
@@ -327,17 +349,91 @@ async def nearby_search(
     return NearbySearchResponse(results=results)
 
 
+def _upsert_business_from_place(db: Session, place_id: str, result: dict) -> Business:
+    """
+    Upsert a Business row from Google Place Details result.
+    Looks up by (provider, provider_place_id) to match the unique constraint.
+    Updates existing row with fresh place data; does not overwrite ai_notes.
+    Returns the business (existing or newly created).
+    """
+    location = result.get("geometry", {}).get("location", {})
+    lat = location.get("lat")
+    lng = location.get("lng")
+    name = result.get("name") or ""
+    formatted_address = result.get("formatted_address")
+    state = _extract_state_from_address_components(result)
+    category = _extract_primary_type(result)
+
+    # Look up by (provider, provider_place_id) to match DB unique constraint
+    business = (
+        db.query(Business)
+        .filter(
+            Business.provider == "google",
+            Business.provider_place_id == place_id,
+        )
+        .first()
+    )
+    if business:
+        # Update with fresh place data; do not touch ai_notes or other curated fields
+        business.name = name
+        business.address = formatted_address
+        business.state = state
+        business.latitude = lat
+        business.longitude = lng
+        business.lat = lat
+        business.lng = lng
+        business.category = category
+        business.external_id_google = place_id
+        db.commit()
+        db.refresh(business)
+        return business
+
+    business = Business(
+        name=name,
+        provider="google",
+        provider_place_id=place_id,
+        external_id_google=place_id,
+        address=formatted_address,
+        state=state,
+        latitude=lat,
+        longitude=lng,
+        lat=lat,
+        lng=lng,
+        category=category,
+    )
+    db.add(business)
+    db.commit()
+    db.refresh(business)
+    return business
+
+
+# TTL for AI context: regenerate if older than this
+AI_CONTEXT_TTL_HOURS = 24
+
+
 @router.get("/details", response_model=PlaceDetailsResponse)
 async def place_details(
     place_id: str = Query(..., description="Google Place ID"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> PlaceDetailsResponse:
     """
     Get detailed information about a place using Google Places API.
-    
-    Returns normalized place details including hours, contact info, and photos.
+
+    Requires authentication and completed onboarding.
+
+    - Upserts a business row (by place_id).
+    - Generates and caches ai_notes if missing.
+    - Generates and caches structured AI context (ai_context) if missing or older than 24h,
+      using the current user's onboarding_preferences for personalization.
+    - Returns business_id so the client can use it for the chat endpoint.
+
+    Returns normalized place details including hours, contact info, photos, ai_notes,
+    business_id, and ai_context.
     """
+    require_onboarding(current_user)
     api_key = _get_api_key()
-    
+
     url = f"{GOOGLE_PLACES_BASE}/details/json"
     params = {
         "place_id": place_id,
@@ -353,22 +449,25 @@ async def place_details(
             "opening_hours",
             "photos",
             "geometry",
+            "address_components",
+            "reviews",
+            "price_level",
         ]),
         "key": api_key,
     }
-    
+
     data = await _call_google_api(url, params)
-    
+
     # Check Google API status field
     status = data.get("status", "UNKNOWN_ERROR")
     if status != "OK":
         error_msg = data.get("error_message", status)
         body_preview = str(data)[:500]
-        
+
         if status == "NOT_FOUND":
             logger.warning(f"Place not found: place_id={place_id}")
             raise HTTPException(status_code=404, detail="Place not found")
-        
+
         logger.error(
             f"Google API logical error: status={status}, "
             f"error_message={error_msg}, body={body_preview}"
@@ -381,13 +480,57 @@ async def place_details(
                 "body": body_preview
             }
         )
-    
+
     result = data.get("result")
     if not result:
         logger.warning(f"Place details empty: place_id={place_id}")
         raise HTTPException(status_code=404, detail="Place not found")
-    
-    return PlaceDetailsResponse(result=_normalize_place_details(result))
+
+    # Upsert business so we can cache ai_notes and ai_context
+    business = _upsert_business_from_place(db, place_id, result)
+
+    # Generate and cache ai_notes if missing
+    ai_notes = business.ai_notes
+    if not (ai_notes and ai_notes.strip()):
+        try:
+            generated = generate_ai_notes_for_business(business, result)
+            if generated and generated.strip():
+                business.ai_notes = generated
+                db.commit()
+                db.refresh(business)
+                ai_notes = business.ai_notes
+        except Exception as e:
+            logger.exception("Failed to generate ai_notes for business %s: %s", business.id, e)
+            ai_notes = None
+
+    # Decide whether to regenerate AI context (Option B: null or older than TTL)
+    user_preferences = current_user.onboarding_preferences if current_user else None
+    now_utc = datetime.now(timezone.utc)
+    need_ai_context = (
+        business.ai_context is None
+        or business.ai_context_last_updated is None
+        or (now_utc - business.ai_context_last_updated) > timedelta(hours=AI_CONTEXT_TTL_HOURS)
+    )
+    if need_ai_context:
+        ai_context_dict = generate_business_ai_context(business, result, user_preferences)
+        if ai_context_dict is not None:
+            business.ai_context = ai_context_dict
+            business.ai_context_last_updated = now_utc
+            db.commit()
+            db.refresh(business)
+
+    ai_context = business.ai_context
+
+    return PlaceDetailsResponse(
+        result=_normalize_place_details(
+            result,
+            ai_notes=ai_notes,
+            business_id=business,
+            ai_context=ai_context,
+        ),
+        business_id=business.id,
+        ai_context=ai_context,
+    )
 
 
 @router.get("/search", response_model=TextSearchResponse)
@@ -401,7 +544,7 @@ async def text_search(
     """
     Search for places by text query using Google Places Text Search API.
     
-    Similar to Yelp-style search. Returns results compatible with /nearby cards.
+    Place text search. Returns results compatible with /nearby cards.
     
     - If lat/lng provided: biases results near that location
     - If lat/lng omitted: searches without location bias
