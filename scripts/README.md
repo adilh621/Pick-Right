@@ -1,5 +1,34 @@
 # Database Scripts
 
+## verify_businesses_rls.sql
+
+Verifies that row-level security (RLS) policies exist on the `businesses` table after applying the `*_businesses_rls_policies` migration.
+
+### When to Run
+
+Run after applying the businesses RLS migration to your Supabase (or Postgres) database, to confirm that the three policies (SELECT, INSERT, UPDATE for `authenticated`) are present.
+
+### How to Run
+
+**Using Supabase SQL Editor:** Paste the contents of `scripts/verify_businesses_rls.sql` and run.
+
+**Using psql:**
+```bash
+psql "your_database_url" -f scripts/verify_businesses_rls.sql
+```
+
+### What It Does
+
+1. Shows whether RLS is enabled on `public.businesses`.
+2. Lists all policies on `businesses` (names, command, roles, expressions).
+
+### Notes
+
+- Requires PostgreSQL (e.g. Supabase). Not for SQLite.
+- Full verification (insert/update as an authenticated user) is done by running the iOS app and confirming upserts succeed; this script only inspects policy metadata.
+
+---
+
 ## backfill_user_timestamps.sql
 
 This script backfills NULL timestamp values in the `users` table.

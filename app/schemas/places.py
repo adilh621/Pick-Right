@@ -18,6 +18,7 @@ class PlaceResult(BaseModel):
     lat: float
     lng: float
     photo_url: Optional[str] = None
+    price_level: Optional[int] = None
 
 
 class NearbySearchResponse(BaseModel):
@@ -90,6 +91,7 @@ class PlaceDetails(BaseModel):
     business_id: Optional[UUID] = None
     # Structured AI context (summary, pros, cons, vibe, best_for_user_profile, etc.)
     ai_context: Optional[dict[str, Any]] = None
+    price_level: Optional[int] = None
 
 
 class PlaceDetailsResponse(BaseModel):

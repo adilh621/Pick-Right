@@ -158,6 +158,7 @@ def _normalize_nearby_place(place: dict) -> PlaceResult:
         lat=location.get("lat", 0.0),
         lng=location.get("lng", 0.0),
         photo_url=_build_photo_url(photo_ref),
+        price_level=place.get("price_level"),
     )
 
 
@@ -226,6 +227,7 @@ def _normalize_place_details(
         ai_notes=ai_notes,
         business_id=business_id.id if business_id else None,
         ai_context=ai_context,
+        price_level=place.get("price_level"),
     )
 
 
@@ -296,10 +298,15 @@ async def _call_google_api(url: str, params: dict) -> dict:
         )
 
 
+# Coordinate bounds for validation (same behavior for any location worldwide)
+LAT_MIN, LAT_MAX = -90.0, 90.0
+LNG_MIN, LNG_MAX = -180.0, 180.0
+
+
 @router.get("/nearby", response_model=NearbySearchResponse)
 async def nearby_search(
-    lat: float = Query(..., description="Latitude"),
-    lng: float = Query(..., description="Longitude"),
+    lat: float = Query(..., ge=LAT_MIN, le=LAT_MAX, description="Latitude (-90 to 90)"),
+    lng: float = Query(..., ge=LNG_MIN, le=LNG_MAX, description="Longitude (-180 to 180)"),
     radius: int = Query(1500, ge=1, le=50000, description="Search radius in meters"),
     type: str = Query("restaurant", description="Place type to search for"),
     current_user: User = Depends(get_current_user),
@@ -308,6 +315,9 @@ async def nearby_search(
     Search for nearby places using Google Places API.
     Requires completed onboarding.
 
+    Accepts any valid coordinates (lat in [-90, 90], lng in [-180, 180]).
+    Use the same lat/lng when the user has chosen a custom location (e.g. "Change location").
+    The server does not geocode; the client must pass coordinates from device or geocoding.
     Returns a normalized list of places with basic info.
     """
     require_onboarding(current_user)
@@ -536,8 +546,8 @@ async def place_details(
 @router.get("/search", response_model=TextSearchResponse)
 async def text_search(
     q: str = Query(..., description="Search query (e.g., 'pizza bronx', 'papa johns')"),
-    lat: float | None = Query(None, description="Latitude for location bias"),
-    lng: float | None = Query(None, description="Longitude for location bias"),
+    lat: float | None = Query(None, ge=LAT_MIN, le=LAT_MAX, description="Latitude for location bias (-90 to 90)"),
+    lng: float | None = Query(None, ge=LNG_MIN, le=LNG_MAX, description="Longitude for location bias (-180 to 180)"),
     radius_m: int = Query(5000, ge=1, le=50000, description="Search radius in meters (used with lat/lng)"),
     limit: int = Query(20, ge=1, le=60, description="Maximum number of results"),
 ) -> TextSearchResponse:
@@ -546,8 +556,8 @@ async def text_search(
     
     Place text search. Returns results compatible with /nearby cards.
     
-    - If lat/lng provided: biases results near that location
-    - If lat/lng omitted: searches without location bias
+    - If lat/lng provided: biases results near that location (any valid coordinates accepted).
+    - If lat/lng omitted: searches without location bias.
     
     Example curl:
     ```bash

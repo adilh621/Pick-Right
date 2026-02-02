@@ -1,4 +1,4 @@
-"""Tests for places router, including _upsert_business_from_place and GET /details."""
+"""Tests for places router, including _upsert_business_from_place, GET /details, and GET /nearby."""
 
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -206,3 +206,128 @@ def test_place_details_returns_200_when_ai_helpers_return_none(client, db_sessio
     assert business is not None
     assert business.ai_notes is None
     assert business.ai_context is None
+
+
+# --- GET /places/nearby: arbitrary coordinates and validation ---
+
+
+def _complete_onboarding(client, token):
+    """Ensure user exists and has completed onboarding so /places/nearby is allowed."""
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+    client.put(
+        "/api/v1/me/onboarding",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"answers": {"diet": "vegetarian", "step": 1}},
+    )
+
+
+def test_places_nearby_rejects_invalid_lat(client, mock_jwks, create_test_token):
+    """GET /places/nearby with lat outside [-90, 90] returns 422."""
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400c1", email="invalid_lat@example.com")
+    _complete_onboarding(client, token)
+    response = client.get(
+        "/api/v1/places/nearby",
+        params={"lat": 91.0, "lng": 0.0},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    detail = response.json().get("detail", [])
+    assert any(
+        "latitude" in str(d).lower() or "lat" in str(d).lower()
+        for d in (detail if isinstance(detail, list) else [detail])
+    )
+
+
+def test_places_nearby_rejects_invalid_lng(client, mock_jwks, create_test_token):
+    """GET /places/nearby with lng outside [-180, 180] returns 422."""
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400c2", email="invalid_lng@example.com")
+    _complete_onboarding(client, token)
+    response = client.get(
+        "/api/v1/places/nearby",
+        params={"lat": 0.0, "lng": 181.0},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
+    detail = response.json().get("detail", [])
+    assert any(
+        "longitude" in str(d).lower() or "lng" in str(d).lower()
+        for d in (detail if isinstance(detail, list) else [detail])
+    )
+
+
+def test_places_nearby_accepts_valid_coordinates_and_passes_to_google(client, mock_jwks, create_test_token):
+    """
+    GET /places/nearby with valid lat/lng returns 200 and passes the same coordinates
+    to the Google API (generic behavior for any location, e.g. Discover or Change location).
+    """
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400c3", email="nearby_ok@example.com")
+    _complete_onboarding(client, token)
+
+    with patch(
+        "app.routers.places._call_google_api",
+        new_callable=AsyncMock,
+        return_value={"status": "OK", "results": []},
+    ) as mock_api:
+        response = client.get(
+            "/api/v1/places/nearby",
+            params={"lat": 40.7128, "lng": -74.0060, "radius": 2000},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json().get("results") == []
+    mock_api.assert_called_once()
+    call_args = mock_api.call_args[0]
+    params = call_args[1]
+    assert params.get("location") == "40.7128,-74.006"  # float may drop trailing zero
+    assert params.get("radius") == 2000
+
+
+def test_places_nearby_different_coordinates_produce_different_results(client, mock_jwks, create_test_token):
+    """
+    Different lat/lng values result in different location params passed to Google,
+    so the Discover feed can be refreshed for a new location (e.g. Change location).
+    """
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400c4", email="diff_coords@example.com")
+    _complete_onboarding(client, token)
+
+    def make_mock_results(lat: float, lng: float):
+        """Return one fake result with name indicating the requested location."""
+        return {
+            "status": "OK",
+            "results": [
+                {
+                    "place_id": f"place_{lat}_{lng}",
+                    "name": f"Place at {lat},{lng}",
+                    "vicinity": "123 Test St",
+                    "geometry": {"location": {"lat": lat, "lng": lng}},
+                    "types": ["restaurant"],
+                }
+            ],
+        }
+
+    with patch("app.routers.places._call_google_api", new_callable=AsyncMock) as mock_api:
+        mock_api.side_effect = [
+            make_mock_results(40.7128, -74.0060),   # NYC
+            make_mock_results(51.5074, -0.1278),   # London
+        ]
+        nyc = client.get(
+            "/api/v1/places/nearby",
+            params={"lat": 40.7128, "lng": -74.0060},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        london = client.get(
+            "/api/v1/places/nearby",
+            params={"lat": 51.5074, "lng": -0.1278},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert nyc.status_code == status.HTTP_200_OK
+    assert london.status_code == status.HTTP_200_OK
+    assert nyc.json()["results"][0]["name"] == "Place at 40.7128,-74.006"  # float may drop trailing zero
+    assert london.json()["results"][0]["name"] == "Place at 51.5074,-0.1278"
+    assert mock_api.call_count == 2
+    locations_called = [
+        mock_api.call_args_list[i][0][1]["location"]
+        for i in range(2)
+    ]
+    assert "40.7128,-74.006" in locations_called[0]
+    assert "51.5074,-0.1278" in locations_called[1]

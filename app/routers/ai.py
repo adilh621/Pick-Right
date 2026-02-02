@@ -8,7 +8,7 @@ from typing import Dict, Any
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from app.services.gemini_client import generate_text, generate_text_with_system
@@ -71,9 +71,23 @@ class ChatRequest(BaseModel):
     business_id: UUID | None = None
     business_context: dict | None = None
     onboarding_preferences: dict | None = None
-    # User location for distance-to-business (optional; used when business has coordinates)
+    # User location for distance-to-business (optional; use same lat/lng as Discover when user overrides location)
     latitude: float | None = None
     longitude: float | None = None
+
+    @field_validator("latitude")
+    @classmethod
+    def latitude_in_range(cls, v: float | None) -> float | None:
+        if v is not None and (v < -90 or v > 90):
+            raise ValueError("latitude must be between -90 and 90")
+        return v
+
+    @field_validator("longitude")
+    @classmethod
+    def longitude_in_range(cls, v: float | None) -> float | None:
+        if v is not None and (v < -180 or v > 180):
+            raise ValueError("longitude must be between -180 and 180")
+        return v
 
 
 class ChatResponse(BaseModel):

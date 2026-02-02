@@ -372,6 +372,18 @@ To test authentication with a real Supabase token:
 - `POST /api/v1/scan-sessions/{scan_session_id}/recommendations` - Create recommendation items (bulk)
 - `GET /api/v1/scan-sessions/{scan_session_id}/recommendations` - Get recommendations for a scan session
 
+### Places (Discover / nearby businesses)
+
+- **`GET /api/v1/places/nearby`** – Nearby places for the **Discover/home feed** (requires Bearer token and completed onboarding).
+  - **Query params:** `lat` (required), `lng` (required), optional `radius` (meters), `type` (e.g. `restaurant`).
+  - **Location is generic:** The endpoint accepts **any valid coordinates** (lat in [-90, 90], lng in [-180, 180]). It is not tied to a “user home location.”
+  - **Change location:** When the user chooses a custom location (e.g. “Change location” in the iOS app), the client must call this endpoint with the **new** `lat` and `lng`. The server will return businesses near that point; no server-side geocoding is used.
+  - **No geocoding on the backend:** Place name → coordinates (geocoding) must be done on the client (e.g. Apple APIs or another geocoding service). The backend expects already-derived coordinates.
+- **`GET /api/v1/places/search`** – Text search for places. Optional `lat`/`lng` bias results near that location; same coordinate validation and client responsibility as above.
+- **`GET /api/v1/places/details`** – Place details by Google Place ID (auth and onboarding required).
+
+**AI chat and location:** For **`POST /api/v1/ai/chat`**, optional `latitude` and `longitude` in the request body are used to compute distance-to-business for answers like “how far is it?”. The iOS app should pass the **same active location** used for the Discover feed (device location or user-chosen “Change location” coordinates). Invalid coordinates (lat outside [-90, 90] or lng outside [-180, 180]) return 422.
+
 ### Chat (business-specific AI conversation)
 - `POST /api/v1/chat/business/{business_id}` - Conversational chat about a specific business (requires Bearer token)
   - Request body: `user_message` (required), optional `chat_session_id` (for client use; history is by user + business)
@@ -408,6 +420,18 @@ The application includes 5 main entities:
 5. **RecommendationItem** - Recommendations generated from scan sessions
 
 See the model files in `app/models/` for detailed field definitions and relationships.
+
+#### Row-Level Security (RLS) on `businesses`
+
+RLS is enabled on `public.businesses`. The migration `*_businesses_rls_policies` defines policies so that **authenticated** users (e.g. mobile app using the anon key with a signed-in user session) can:
+
+- **SELECT** all rows
+- **INSERT** new rows (e.g. Google Places upserts from the iOS app)
+- **UPDATE** existing rows (e.g. refreshing rating, photo_url, price_level)
+
+There is no owner/creator column on `businesses`; the current policies allow any authenticated user to insert and update. If you later add a creator column, you can tighten UPDATE (and optionally INSERT) to that column.
+
+**Verification:** After applying the migration to your Supabase project, run the iOS app and confirm that upserts to `businesses` succeed and that fields such as `price_level`, `photo_url`, and `rating` persist.
 
 ## Development
 

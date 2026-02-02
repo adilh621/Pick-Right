@@ -104,3 +104,57 @@ def test_chat_404_when_business_id_not_found(client, mock_jwks, create_test_toke
         json={"message": "Hi", "business_id": fake_uuid},
     )
     assert resp.status_code == 404
+
+
+def test_chat_rejects_invalid_latitude(client, mock_jwks, create_test_token, db_session):
+    """POST /ai/chat with latitude outside [-90, 90] returns 422."""
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+    business = Business(
+        name="Test Place",
+        provider="google",
+        provider_place_id="ChIJ-invalid-lat",
+    )
+    db_session.add(business)
+    db_session.commit()
+    db_session.refresh(business)
+    resp = client.post(
+        "/api/v1/ai/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "message": "How far?",
+            "business_id": str(business.id),
+            "latitude": 91.0,
+            "longitude": 0.0,
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json().get("detail", [])
+    assert any("latitude" in str(d).lower() for d in (detail if isinstance(detail, list) else [detail]))
+
+
+def test_chat_rejects_invalid_longitude(client, mock_jwks, create_test_token, db_session):
+    """POST /ai/chat with longitude outside [-180, 180] returns 422."""
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+    business = Business(
+        name="Test Place",
+        provider="google",
+        provider_place_id="ChIJ-invalid-lng",
+    )
+    db_session.add(business)
+    db_session.commit()
+    db_session.refresh(business)
+    resp = client.post(
+        "/api/v1/ai/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "message": "How far?",
+            "business_id": str(business.id),
+            "latitude": 0.0,
+            "longitude": 181.0,
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json().get("detail", [])
+    assert any("longitude" in str(d).lower() for d in (detail if isinstance(detail, list) else [detail]))
