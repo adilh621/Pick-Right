@@ -23,7 +23,10 @@ class Settings(BaseSettings):
     google_maps_api_key: str | None = None
     
     # Gemini AI configuration (optional)
+    # gemini_api_key: used for ai_context and ai_notes generation (places, business_context, ai_notes_service)
     gemini_api_key: str | None = None
+    # gemini_api_key2: used only for the conversational chat endpoint (POST /api/v1/chat/business/{id})
+    gemini_api_key2: str | None = None
     gemini_model: str = "gemini-2.5-flash"
     # Cooldown in seconds after 429 RESOURCE_EXHAUSTED; used when RetryInfo not present
     gemini_quota_cooldown_seconds: int = 60

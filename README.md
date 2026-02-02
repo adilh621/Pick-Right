@@ -372,6 +372,13 @@ To test authentication with a real Supabase token:
 - `POST /api/v1/scan-sessions/{scan_session_id}/recommendations` - Create recommendation items (bulk)
 - `GET /api/v1/scan-sessions/{scan_session_id}/recommendations` - Get recommendations for a scan session
 
+### Chat (business-specific AI conversation)
+- `POST /api/v1/chat/business/{business_id}` - Conversational chat about a specific business (requires Bearer token)
+  - Request body: `user_message` (required), optional `chat_session_id` (for client use; history is by user + business)
+  - Response: `assistant_message`, optional `chat_session_id`, `metadata` (e.g. `model`, `created_at`, `business_id`)
+  - Context is built from the authenticated user's onboarding preferences, the business (name, category, address, `ai_context`, `ai_notes`), and conversation history from the DB. On quota/overload (429), returns 503 with `error: "model_overloaded"` and a friendly message.
+  - **Uses a separate Gemini key:** this route uses `GEMINI_API_KEY2`; ai_context and ai_notes generation use `GEMINI_API_KEY`.
+
 ## Running Tests
 
 ```bash
@@ -474,6 +481,11 @@ Required environment variables (set in `.env` file):
 
 - `SUPABASE_JWT_AUDIENCE` - JWT audience claim (optional, default: `"authenticated"`)
   - Typically `"authenticated"` for Supabase access tokens
+
+Optional Gemini AI environment variables:
+
+- `GEMINI_API_KEY` - Used for ai_context and ai_notes generation (places details, business context). If unset, those features are skipped.
+- `GEMINI_API_KEY2` - Used only for the conversational chat endpoint (`POST /api/v1/chat/business/{business_id}`). If unset, the chat endpoint will return 500.
 
 Derived environment variables (automatically set from `SUPABASE_URL`):
 

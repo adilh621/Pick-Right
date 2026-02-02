@@ -18,7 +18,6 @@ from app.core.geo import haversine_distance_km, km_to_miles
 from app.db.session import get_db
 from app.models.user import User
 from app.models.business import Business
-from app.models.business_chat_message import BusinessChatMessage
 
 logger = logging.getLogger(__name__)
 
@@ -114,18 +113,8 @@ def _format_hours_response(place_data: dict) -> str:
 
 
 def _get_chat_history(db: Session, user_id: UUID, business_id: UUID, limit: int = 50) -> list[tuple[str, str]]:
-    """Load chat history for (user_id, business_id) as list of (role, content) ordered by created_at."""
-    rows = (
-        db.query(BusinessChatMessage.role, BusinessChatMessage.content)
-        .filter(
-            BusinessChatMessage.user_id == user_id,
-            BusinessChatMessage.business_id == business_id,
-        )
-        .order_by(BusinessChatMessage.created_at.asc())
-        .limit(limit)
-        .all()
-    )
-    return [(r.role, r.content) for r in rows]
+    """Return chat history for (user_id, business_id). Stateless: no DB; returns empty list."""
+    return []
 
 
 def _format_preferences_response(preferences: Dict[str, Any] | None) -> str:
@@ -550,24 +539,6 @@ def _handle_general_query(
                 status_code=503,
                 detail={"error": "gemini_unavailable", "message": "AI is temporarily unavailable; please try again later."},
             )
-
-        # Persist user message and assistant reply when we have db, current_user, and business_id
-        if db is not None and current_user is not None and business_id is not None:
-            user_msg = BusinessChatMessage(
-                user_id=current_user.id,
-                business_id=business_id,
-                role="user",
-                content=message,
-            )
-            db.add(user_msg)
-            assistant_msg = BusinessChatMessage(
-                user_id=current_user.id,
-                business_id=business_id,
-                role="assistant",
-                content=reply,
-            )
-            db.add(assistant_msg)
-            db.commit()
 
         return ChatResponse(reply=reply, ai_context=ai_context_for_response)
     except HTTPException:
