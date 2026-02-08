@@ -10,6 +10,8 @@ if TYPE_CHECKING:
 
 class BusinessBase(BaseModel):
     name: str
+    provider: str = "google"
+    provider_place_id: str
     external_id_google: Optional[str] = None
     address_full: Optional[str] = None
     address: Optional[str] = None

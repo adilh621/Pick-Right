@@ -117,11 +117,14 @@ def test_place_details_returns_top_level_business_id_and_ai_context(client, db_s
             patch(
                 "app.routers.places.generate_business_ai_context",
                 return_value=fixed_ai_context,
-            ),
+            ) as mock_ai_context,
         ):
             response = client.get(
                 f"/api/v1/places/details?place_id={place_id}",
             )
+        # AI context is generic: no user preferences passed
+        mock_ai_context.assert_called_once()
+        assert mock_ai_context.call_args[0][2] is None
     finally:
         app.dependency_overrides.pop(get_current_user, None)
 

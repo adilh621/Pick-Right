@@ -60,6 +60,53 @@ def test_chat_business_200_returns_assistant_message(
     assert "created_at" in data["metadata"]
 
 
+def test_chat_business_context_includes_business_and_user_profile(
+    client, db_session, mock_jwks, create_test_token
+):
+    """
+    Chat endpoint builds context with both business and user_profile;
+    user_content passed to Gemini contains JSON with these keys and user_profile has onboarding prefs.
+    """
+    token = create_test_token(sub=TEST_SUPABASE_UID_1)
+    r_me = client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+    r_me.raise_for_status()
+    user_id = r_me.json()["id"]
+    user = db_session.query(User).filter(User.id == UUID(user_id)).first()
+    user.onboarding_preferences = {"budget": "mid", "vibe": "casual"}
+    user.onboarding_completed_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    business = Business(
+        name="Test Restaurant",
+        provider="google",
+        provider_place_id="ChIJ-ctx-123",
+        ai_context={"summary": "Great spot", "vibe": "Casual"},
+        ai_notes="Popular for brunch.",
+    )
+    db_session.add(business)
+    db_session.commit()
+    db_session.refresh(business)
+
+    with patch("app.routers.chat.generate_text_with_system_chat") as mock_gen:
+        mock_gen.return_value = "Sure."
+        resp = client.post(
+            f"/api/v1/chat/business/{business.id}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"user_message": "Is this good for me?"},
+        )
+
+    assert resp.status_code == 200
+    mock_gen.assert_called_once()
+    user_content, _ = mock_gen.call_args[0]
+    assert "Context (JSON):" in user_content
+    assert '"business"' in user_content
+    assert '"user_profile"' in user_content
+    assert "budget" in user_content and "mid" in user_content
+    assert "vibe" in user_content and "casual" in user_content
+    assert "Test Restaurant" in user_content
+    assert "Great spot" in user_content
+
+
 def test_chat_business_503_when_gemini_returns_none(client, db_session, mock_jwks, create_test_token):
     """When generate_text_with_system_chat returns None (quota), return 503 with model_overloaded."""
     token = create_test_token(sub=TEST_SUPABASE_UID_1)
@@ -127,8 +174,8 @@ def test_chat_business_with_distance_miles_injects_into_prompt(
     client, db_session, mock_jwks, create_test_token
 ):
     """
-    When request includes distance_miles, the system instruction passed to Gemini
-    contains the distance (e.g. approximately 1.3 miles) and distance_miles in context.
+    When request includes distance_miles, the user content passed to Gemini
+    contains the context JSON with distance_miles and user_distance_note in business.
     """
     token = create_test_token(sub=TEST_SUPABASE_UID_1)
     r_me = client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
@@ -163,20 +210,19 @@ def test_chat_business_with_distance_miles_injects_into_prompt(
 
     mock_gen.assert_called_once()
     user_content, system_instruction = mock_gen.call_args[0]
-    assert "approximately 1.3 miles" in system_instruction
-    assert "distance_miles" in system_instruction
-    assert "1.3" in system_instruction
-    # Ensure the JSON block the model sees contains distance_miles and user_distance_note
-    assert '"distance_miles": 1.3' in system_instruction
-    assert "user_distance_note" in system_instruction
+    # Context is in user content (first arg), not system instruction
+    assert "Context (JSON):" in user_content
+    assert '"distance_miles": 1.3' in user_content
+    assert "user_distance_note" in user_content
+    assert "approximately 1.3 miles" in user_content
 
 
 def test_chat_business_without_distance_miles_works_and_omits_distance(
     client, db_session, mock_jwks, create_test_token
 ):
     """
-    When request omits distance_miles, endpoint returns 200 and the system
-    instruction does not contain a fabricated distance line (e.g. no "approximately ... miles away").
+    When request omits distance_miles, endpoint returns 200 and the context
+    in user content does not include distance_miles in the business object.
     """
     token = create_test_token(sub=TEST_SUPABASE_UID_1)
     r_me = client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
@@ -207,5 +253,8 @@ def test_chat_business_without_distance_miles_works_and_omits_distance(
 
     assert resp.status_code == 200
     mock_gen.assert_called_once()
-    user_content, system_instruction = mock_gen.call_args[0]
-    assert '"distance_miles"' not in system_instruction
+    user_content, _ = mock_gen.call_args[0]
+    # Context is in user content; business object should not have distance_miles when not requested
+    assert "Context (JSON):" in user_content
+    # When distance_miles is omitted, build_business_chat_context does not add distance_miles to business
+    assert '"distance_miles"' not in user_content

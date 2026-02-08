@@ -17,17 +17,15 @@ from app.services.gemini_client import generate_text_with_system
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are PickRight, an AI that summarizes a SINGLE local business for a user.
+SYSTEM_PROMPT = """You are PickRight, an AI that summarizes a SINGLE local business.
 
-You are given:
-1. Structured data about the business (name, address, category, rating, reviews, etc.).
-2. Optional: the user's onboarding preferences (budget, vibe, distance, dietary, etc.).
+You are given structured data about the business (name, address, category, rating, reviews, etc.). Your output must be GENERIC: describe the business only. Do not mention any specific user, age, religion, dietary needs, or per-user onboarding preferences.
 
 Your task: Produce a single JSON object with exactly these keys (use empty strings or empty arrays if you have no info):
 - "summary": string — 1–3 sentence overview of the place.
 - "pros": array of strings — 3–7 positive points (what people like, standout items, strengths).
 - "cons": array of strings — 0–5 drawbacks or caveats (e.g. wait times, price, limited options).
-- "best_for_user_profile": string — Who this place is best for; if user preferences are given, personalize this (e.g. "Great for your budget and love of spicy food").
+- "best_for_user_profile": string — A generic description of who this place is best for (e.g. "Great for casual groups and budget-conscious diners"). Do NOT personalize to "you" or "your"; keep it generic.
 - "vibe": string — Ambiance / atmosphere (e.g. casual, date night, family-friendly).
 - "reliability_notes": string — How reliable the info is (e.g. "Based on Google reviews and place details").
 - "source_notes": string — Brief note on what sources were used (e.g. "Google Place details and reviews").
@@ -48,15 +46,8 @@ def _format_review_snippets(place_data: dict) -> str:
     return "\n\n".join(snippets) if snippets else "(No review snippets available)"
 
 
-def _extract_user_prefs_summary(preferences: dict | None) -> str:
-    """Format user onboarding preferences for the prompt."""
-    if not preferences or not isinstance(preferences, dict):
-        return "(No user preferences provided)"
-    return json.dumps(preferences, indent=2)
-
-
-def _build_user_prompt(business: Business, place_data: dict, user_preferences: dict | None) -> str:
-    """Build the user prompt with business + place data + optional user prefs."""
+def _build_user_prompt(business: Business, place_data: dict) -> str:
+    """Build the user prompt with business + place data only (generic, no user preferences)."""
     name = business.name or "Unknown"
     category = business.category or (place_data.get("types") or [""])[0] if place_data.get("types") else "Not specified"
     address = business.address or business.address_full or ""
@@ -66,7 +57,6 @@ def _build_user_prompt(business: Business, place_data: dict, user_preferences: d
     price_level = place_data.get("price_level")
     types = place_data.get("types") or []
     review_snippets = _format_review_snippets(place_data)
-    prefs_summary = _extract_user_prefs_summary(user_preferences)
 
     return f"""Business:
 - name: {name}
@@ -79,10 +69,7 @@ def _build_user_prompt(business: Business, place_data: dict, user_preferences: d
 Sample review snippets:
 {review_snippets}
 
-User onboarding preferences (use to personalize best_for_user_profile):
-{prefs_summary}
-
-Respond with a single JSON object only (keys: summary, pros, cons, best_for_user_profile, vibe, reliability_notes, source_notes)."""
+Respond with a single JSON object only (keys: summary, pros, cons, best_for_user_profile, vibe, reliability_notes, source_notes). Keep best_for_user_profile generic (e.g. who the place suits in general), not personalized to any user."""
 
 
 def _parse_json_from_response(text: str) -> dict[str, Any]:
@@ -112,14 +99,14 @@ def generate_business_ai_context(
     Args:
         business: SQLAlchemy Business model (name, address, category, etc.).
         place_data: Raw Google Place Details API result (rating, reviews, types, etc.).
-        user_preferences: Optional user onboarding_preferences for personalization.
+        user_preferences: Unused; kept for backward compatibility. AI context is now generic.
 
     Returns:
         Dict suitable for Business.ai_context (JSONB), with keys from BusinessAIContext;
         or None on LLM/network error so the endpoint can still return 200 with ai_context omitted.
         On parse failure or empty response, returns a minimal dict (e.g. summary only).
     """
-    user_prompt = _build_user_prompt(business, place_data, user_preferences)
+    user_prompt = _build_user_prompt(business, place_data)
     try:
         response_text = generate_text_with_system(user_prompt, SYSTEM_PROMPT)
     except Exception as e:

@@ -7,6 +7,7 @@ server-side chat storage. On 429/quota, returns 503 with a friendly
 model_overloaded message.
 """
 
+import json
 import logging
 import traceback
 from datetime import datetime, timezone
@@ -22,59 +23,85 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.models.business import Business
 from app.models.user import User
-from app.routers.ai import (
-    _build_business_context_payload,
-    _build_user_content_with_history,
-    _business_context_json_section,
-    _user_preferences_json_section,
-)
+from app.routers.ai import _build_user_content_with_history
 from app.services.gemini_client import generate_text_with_system_chat
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
-# System prompt for the business chat assistant. Ground answers in user prefs,
-# business.ai_context, business.ai_notes, and Places data; do not hallucinate.
-CHAT_BUSINESS_SYSTEM_PROMPT = """You are PickRight, a recommendation assistant helping the user decide whether ONE specific business is a good fit for them.
+# System prompt for the business chat endpoint. Context (business + user_profile) is passed in user content as JSON.
+CHAT_BUSINESS_SYSTEM_PROMPT = """You are PickRight, an AI guide helping a single specific user decide whether one specific business is a good fit for them.
 
-You are given:
-- Structured business info (name, category, address, coordinates, rating, price, ai_notes, and optional AI context: summary, pros, cons, vibe, best_for_user_profile).
-- Optional distance: when present, the business context may include distance_miles and a note that the user is approximately X miles away.
-- The user's onboarding preferences (e.g. halal, budget, vibe, dietary).
-- The conversation history for this user and this business.
+You receive a JSON object with:
+- business: objective info and AI summary of the place (name, address, category, summary, pros, cons, vibe, ai_notes, and optional distance_miles / user_distance_note).
+- user_profile: this user's onboarding preferences from onboarding.
 
-Rules:
+Your job:
+- Always reason from both business info AND user_profile.
+- For vague questions like "Is this good?" or "What's the vibe?", interpret them as: "Is this a good fit for ME personally given my preferences?"
+- Explicitly mention how the place matches or conflicts with key preferences when relevant (e.g. "You said ambiance and halal options matter. This place has a cozy vibe, but there's no clear indication it's halal-friendly…").
+- If there are clear conflicts (dietary restriction vs business type, budget vs price_level, need for quiet vs lively sports-bar vibe), gently flag that and suggest what to double-check.
+- Use only concrete details from the business context; do not guess or invent.
 - Stay on-topic: the user is asking about THIS business. Do not suggest other places unless they explicitly ask.
-- ALWAYS ground your answers in: the user's preferences, the business.ai_context, the business.ai_notes, and the business/Places data provided. If something is unknown or not present in the data, say so clearly (e.g. "We don't have that information") instead of inventing or guessing.
-- Distance: When distance_miles or user_distance_note is present in the context, do NOT say you lack distance information. Answer using that distance. Only use phrasing like "I don't have information about your distance to this business" when the context truly has no distance info (no distance_miles, no user_distance_note).
-- Time estimates: If the user asks how long it will take to get there and distance is available, you may give rough walking and driving time estimates. Assume walking speed approximately 3 mph and local driving speed approximately 20-25 mph; clearly label these as approximate. Example: "It's about 1.3 miles away, which is roughly a 25-minute walk or a 5- to 10-minute drive, depending on traffic."
-- Be concrete and specific when the data is present. Do not repeat the user's preferences in every answer; use them as background when relevant.
-- Tone: friendly, concise, and clear. Return markdown."""
+- When distance_miles or user_distance_note is present in the context, use it for distance and "how long will it take" questions. You may give rough walking (~3 mph) and driving (~20–25 mph) time estimates; label them as approximate.
+- Answer in concise markdown, friendly but not overly verbose."""
 
 
-def build_chat_system_prompt(
-    business_context_payload: Dict[str, Any] | None = None,
-    user_preferences: Dict[str, Any] | None = None,
-) -> str:
+def build_business_chat_context(
+    business: Business,
+    distance_miles: float | None,
+    user_preferences: dict,
+) -> dict:
     """
-    Build the full system instruction for the business chat endpoint.
-    Composes CHAT_BUSINESS_SYSTEM_PROMPT with business context and user preferences (JSON).
+    Build a single structured context dict for the business chat model.
+    Contains business (identity, address, ai_context fields, ai_notes, distance) and user_profile.
     """
-    parts: list[str] = [CHAT_BUSINESS_SYSTEM_PROMPT]
-    if business_context_payload:
-        parts.append("")
-        parts.append(_business_context_json_section(business_context_payload))
-        if business_context_payload.get("distance_miles") is not None or business_context_payload.get("user_distance_note"):
-            parts.append("")
-            parts.append(
-                "The BusinessContext above includes the user's distance; use it for distance and "
-                "'how long will it take' questions."
-            )
-    if user_preferences and isinstance(user_preferences, dict):
-        parts.append("")
-        parts.append(_user_preferences_json_section(user_preferences))
-    return "\n\n".join(parts).strip()
+    addr_full = getattr(business, "address", None) or business.address_full
+    addr_state = getattr(business, "state", None)
+    address = None
+    if addr_full or addr_state:
+        address = {k: v for k, v in ({"full": addr_full, "state": addr_state}.items()) if v is not None}
+    elif business.address_full:
+        address = {"full": business.address_full}
+
+    lat_val = business.latitude if getattr(business, "latitude", None) is not None else business.lat
+    lng_val = business.longitude if getattr(business, "longitude", None) is not None else business.lng
+    coordinates = {"lat": lat_val, "lng": lng_val} if (lat_val is not None and lng_val is not None) else None
+
+    ai_context = getattr(business, "ai_context", None) or {}
+    if not isinstance(ai_context, dict):
+        ai_context = {}
+
+    business_dict: Dict[str, Any] = {
+        "id": str(business.id),
+        "name": business.name,
+        "address": address,
+        "category": business.category,
+        "coordinates": coordinates,
+        "ai_summary": ai_context.get("summary") if ai_context else None,
+        "ai_pros": (ai_context.get("pros") if ai_context else []) or [],
+        "ai_cons": (ai_context.get("cons") if ai_context else []) or [],
+        "ai_vibe": ai_context.get("vibe") if ai_context else None,
+        "ai_notes": getattr(business, "ai_notes", None),
+    }
+    if distance_miles is not None:
+        business_dict["distance_miles"] = distance_miles
+        business_dict["user_distance_note"] = (
+            f"The user is approximately {distance_miles:.1f} miles away from this business."
+        )
+    # Drop None values so JSON is minimal
+    business_dict = {k: v for k, v in business_dict.items() if v is not None}
+
+    return {
+        "business": business_dict,
+        "user_profile": user_preferences if isinstance(user_preferences, dict) else {},
+    }
+
+
+def build_chat_system_prompt() -> str:
+    """Return the system instruction for the business chat endpoint (no context embedded; context goes in user content)."""
+    return CHAT_BUSINESS_SYSTEM_PROMPT.strip()
 
 
 class ChatMessageTurn(BaseModel):
@@ -125,11 +152,8 @@ def chat_business(
     ai_notes). Responses are generated with GEMINI_API_KEY2. On quota/overload
     (429), returns 503 with error "model_overloaded" and a friendly message.
 
-    Manual verification (distance): Run the backend, then POST
-    /api/v1/chat/business/{business_id} with JSON body including
-    distance_miles: 1.3. In logs, confirm distance_miles=1.3 and
-    user_distance_note is non-null. The system_instruction passed to Gemini
-    includes the BusinessContext JSON with distance_miles and user_distance_note.
+    Context (business + user_profile) is passed in the user content as JSON;
+    distance_miles when provided is included in context.business.
     """
     message = request.user_message.strip()
     if not message:
@@ -139,32 +163,24 @@ def chat_business(
     if not business:
         raise HTTPException(status_code=404, detail="Business not found")
 
-    business_context_payload = _build_business_context_payload(
-        business,
-        None,
-        ai_context=getattr(business, "ai_context", None),
-    )
-    if request.distance_miles is not None:
-        business_context_payload["distance_miles"] = request.distance_miles
-        business_context_payload["user_distance_note"] = (
-            f"The user is approximately {request.distance_miles:.1f} miles away from this business."
-        )
-    logger.info(
-        "business_chat distance_miles=%s user_distance_note=%s",
-        request.distance_miles,
-        business_context_payload.get("user_distance_note"),
-    )
     user_preferences = current_user.onboarding_preferences or {}
+    context = build_business_chat_context(
+        business,
+        request.distance_miles,
+        user_preferences,
+    )
+    logger.info(
+        "business_chat distance_miles=%s",
+        request.distance_miles,
+    )
 
     history_from_request: list[tuple[str, str]] = []
     if request.messages:
         history_from_request = [(m.role, m.content) for m in request.messages]
 
-    system_instruction = build_chat_system_prompt(
-        business_context_payload=business_context_payload,
-        user_preferences=user_preferences,
-    )
-    user_content = _build_user_content_with_history(history_from_request, message)
+    system_instruction = build_chat_system_prompt()
+    context_blob = "Context (JSON):\n" + json.dumps(context, indent=2)
+    user_content = context_blob + "\n\n" + _build_user_content_with_history(history_from_request, message)
 
     logger.info(
         "Chat business: business_id=%s user_id=%s message_len=%d history_len=%d",

@@ -434,8 +434,8 @@ async def place_details(
 
     - Upserts a business row (by place_id).
     - Generates and caches ai_notes if missing.
-    - Generates and caches structured AI context (ai_context) if missing or older than 24h,
-      using the current user's onboarding_preferences for personalization.
+    - Generates and caches structured AI context (ai_context) if missing or older than 24h;
+      ai_context is generic (no per-user personalization).
     - Returns business_id so the client can use it for the chat endpoint.
 
     Returns normalized place details including hours, contact info, photos, ai_notes,
@@ -514,7 +514,6 @@ async def place_details(
             ai_notes = None
 
     # Decide whether to regenerate AI context (Option B: null or older than TTL)
-    user_preferences = current_user.onboarding_preferences if current_user else None
     now_utc = datetime.now(timezone.utc)
     need_ai_context = (
         business.ai_context is None
@@ -522,7 +521,7 @@ async def place_details(
         or (now_utc - business.ai_context_last_updated) > timedelta(hours=AI_CONTEXT_TTL_HOURS)
     )
     if need_ai_context:
-        ai_context_dict = generate_business_ai_context(business, result, user_preferences)
+        ai_context_dict = generate_business_ai_context(business, result, None)
         if ai_context_dict is not None:
             business.ai_context = ai_context_dict
             business.ai_context_last_updated = now_utc

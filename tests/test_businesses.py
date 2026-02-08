@@ -8,6 +8,8 @@ def test_create_business(client):
         "/api/v1/businesses",
         json={
             "name": "Test Restaurant",
+            "provider": "google",
+            "provider_place_id": "ChIJ-test-create",
             "category": "restaurant",
             "address_full": "123 Test St"
         }
@@ -43,7 +45,11 @@ def test_get_business(seeded_client):
     # Create a business first
     create_response = seeded_client.post(
         "/api/v1/businesses",
-        json={"name": "Test Business"}
+        json={
+            "name": "Test Business",
+            "provider": "google",
+            "provider_place_id": "ChIJ-test-get",
+        }
     )
     business_id = create_response.json()["id"]
     

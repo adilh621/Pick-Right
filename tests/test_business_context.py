@@ -36,3 +36,35 @@ def test_generate_business_ai_context_returns_none_when_llm_returns_none(db_sess
         result = generate_business_ai_context(business, _minimal_place_data())
 
     assert result is None
+
+
+def test_generate_business_ai_context_prompt_is_generic_no_user_preferences(db_session):
+    """
+    The prompt passed to the LLM must not contain user preferences or personalization.
+    AI context is generic (same for all users).
+    """
+    business = Business(
+        name="Test Restaurant",
+        provider="google",
+        provider_place_id="ChIJ-test-generic",
+    )
+    db_session.add(business)
+    db_session.commit()
+    db_session.refresh(business)
+    place_data = _minimal_place_data()
+
+    with patch("app.ai.business_context.generate_text_with_system") as mock_llm:
+        mock_llm.return_value = '{"summary": "A place.", "pros": [], "cons": [], "best_for_user_profile": "Anyone.", "vibe": "Casual", "reliability_notes": "", "source_notes": ""}'
+        generate_business_ai_context(business, place_data, None)
+        generate_business_ai_context(business, place_data, {"diet": "vegetarian", "budget": "low"})
+
+    assert mock_llm.call_count >= 1
+    for call in mock_llm.call_args_list:
+        user_prompt = call.args[0]
+        assert isinstance(user_prompt, str)
+        # Must not include user preferences or their values (AI context is generic)
+        assert "User onboarding preferences" not in user_prompt
+        assert "vegetarian" not in user_prompt
+        assert "low" not in user_prompt
+        assert "generic" in user_prompt.lower()
+        assert "best_for_user_profile" in user_prompt
