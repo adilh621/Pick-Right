@@ -1,5 +1,13 @@
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
+
 import pytest
 from fastapi import status
+
+from app.core.auth import get_current_user
+from app.main import app
+from app.models.business import Business
+from app.models.user import User
 
 
 def test_create_business(client):
@@ -58,4 +66,112 @@ def test_get_business(seeded_client):
     data = response.json()
     assert data["id"] == business_id
     assert data["name"] == "Test Business"
+
+
+# --- GET /businesses/{id}/ai-insights ---
+
+
+def test_ai_insights_returns_404_for_invalid_business_id(client, mock_jwks, create_test_token):
+    """GET /businesses/{id}/ai-insights returns 404 when business id is invalid."""
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400a1", email="ai_insights@example.com")
+    fake_uuid = "550e8400-e29b-41d4-a716-446655440099"  # no such business
+    app.dependency_overrides[get_current_user] = lambda: MagicMock(
+        spec=User,
+        id=None,
+        onboarding_completed_at=datetime.now(timezone.utc),
+    )
+    try:
+        response = client.get(
+            f"/api/v1/businesses/{fake_uuid}/ai-insights",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+
+
+def test_ai_insights_returns_ready_when_fresh(client, db_session, mock_jwks, create_test_token):
+    """GET /businesses/{id}/ai-insights returns ai_status=ready with data when present and fresh."""
+    from app.routers.places import _upsert_business_from_place
+
+    place_id = "ChIJai-ready-test"
+    result = {
+        "place_id": place_id,
+        "name": "AI Ready Place",
+        "formatted_address": "456 Ready St",
+        "geometry": {"location": {"lat": 40.8, "lng": -74.0}},
+        "address_components": [],
+        "types": ["cafe"],
+    }
+    business = _upsert_business_from_place(db_session, place_id, result)
+    business.ai_notes = "Cozy spot for coffee."
+    business.ai_context = {
+        "summary": "A nice cafe.",
+        "vibe": "Cozy",
+        "pros": ["Good coffee"],
+    }
+    business.ai_context_last_updated = datetime.now(timezone.utc)
+    db_session.commit()
+    db_session.refresh(business)
+
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400a2", email="ready@example.com")
+    app.dependency_overrides[get_current_user] = lambda: MagicMock(
+        spec=User,
+        id=None,
+        onboarding_completed_at=datetime.now(timezone.utc),
+    )
+    try:
+        response = client.get(
+            f"/api/v1/businesses/{business.id}/ai-insights",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert data["business_id"] == str(business.id)
+    assert data["ai_status"] == "ready"
+    assert data["ai_notes"] == "Cozy spot for coffee."
+    assert data["ai_context"]["summary"] == "A nice cafe."
+
+
+def test_ai_insights_returns_pending_when_missing(client, db_session, mock_jwks, create_test_token):
+    """GET /businesses/{id}/ai-insights returns ai_status=pending when AI data missing but business exists."""
+    from app.routers.places import _upsert_business_from_place
+
+    place_id = "ChIJai-pending-test"
+    result = {
+        "place_id": place_id,
+        "name": "AI Pending Place",
+        "formatted_address": "789 Pending St",
+        "geometry": {"location": {"lat": 40.9, "lng": -74.1}},
+        "address_components": [],
+        "types": ["restaurant"],
+    }
+    business = _upsert_business_from_place(db_session, place_id, result)
+    assert business.ai_notes is None
+    assert business.ai_context is None
+    db_session.commit()
+
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400a3", email="pending@example.com")
+    app.dependency_overrides[get_current_user] = lambda: MagicMock(
+        spec=User,
+        id=None,
+        onboarding_completed_at=datetime.now(timezone.utc),
+    )
+    try:
+        response = client.get(
+            f"/api/v1/businesses/{business.id}/ai-insights",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert data["business_id"] == str(business.id)
+    assert data["ai_status"] == "pending"
+    assert data["ai_notes"] is None
+    assert data["ai_context"] is None
 

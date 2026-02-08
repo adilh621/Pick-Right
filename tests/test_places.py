@@ -75,33 +75,37 @@ def test_upsert_business_from_place_updates_existing_row(db_session):
     assert b2.ai_notes == "curated user notes"
 
 
-def test_place_details_returns_top_level_business_id_and_ai_context(client, db_session):
+def test_place_details_when_ai_fresh_returns_ready_and_includes_ai(client, db_session):
     """
-    GET /places/details with mocked Google API and LLM returns 200 with top-level
-    business_id and ai_context; DB business row has ai_context and ai_context_last_updated set.
+    When business already has fresh ai_notes and ai_context (TTL < 24h),
+    GET /places/details returns ai_status="ready" and includes ai_notes and ai_context;
+    no background task is scheduled.
     """
     place_id = "ChIJtest123"
     minimal_result = _minimal_place_result(place_id, name="Papa Johns Pizza")
-
-    mock_user = MagicMock(spec=User)
-    mock_user.id = None  # not used for this test
-    mock_user.onboarding_completed_at = datetime.now(timezone.utc)
-    mock_user.onboarding_preferences = {"diet": "vegetarian"}
-
     fixed_ai_context = {
         "summary": "Test summary for Papa Johns.",
         "pros": ["Good for groups", "Fast delivery"],
         "cons": [],
-        "best_for_user_profile": "Great for your vegetarian preferences.",
+        "best_for_user_profile": "Great for casual groups.",
         "vibe": "Casual",
         "reliability_notes": "Based on Google reviews.",
         "source_notes": "Google Place details and reviews.",
     }
 
-    def override_get_current_user():
-        return mock_user
+    # Pre-seed business with fresh AI data
+    business = _upsert_business_from_place(db_session, place_id, minimal_result)
+    business.ai_notes = "Test ai notes"
+    business.ai_context = fixed_ai_context
+    business.ai_context_last_updated = datetime.now(timezone.utc)
+    db_session.commit()
+    db_session.refresh(business)
 
-    app.dependency_overrides[get_current_user] = override_get_current_user
+    mock_user = MagicMock(spec=User)
+    mock_user.id = None
+    mock_user.onboarding_completed_at = datetime.now(timezone.utc)
+    mock_user.onboarding_preferences = {"diet": "vegetarian"}
+    app.dependency_overrides[get_current_user] = lambda: mock_user
 
     try:
         with (
@@ -111,50 +115,70 @@ def test_place_details_returns_top_level_business_id_and_ai_context(client, db_s
                 return_value={"status": "OK", "result": minimal_result},
             ),
             patch(
-                "app.routers.places.generate_ai_notes_for_business",
-                return_value="Test ai notes",
-            ),
-            patch(
-                "app.routers.places.generate_business_ai_context",
-                return_value=fixed_ai_context,
-            ) as mock_ai_context,
+                "app.routers.places.generate_and_save_business_ai_insights",
+            ) as mock_save_insights,
         ):
-            response = client.get(
-                f"/api/v1/places/details?place_id={place_id}",
-            )
-        # AI context is generic: no user preferences passed
-        mock_ai_context.assert_called_once()
-        assert mock_ai_context.call_args[0][2] is None
+            response = client.get(f"/api/v1/places/details?place_id={place_id}")
+        mock_save_insights.assert_not_called()
     finally:
         app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code == status.HTTP_200_OK
     data = response.json()
-    assert "result" in data
+    assert data.get("ai_status") == "ready"
     assert data["result"]["provider_place_id"] == place_id
-    assert "business_id" in data
     assert data["business_id"] is not None
-    assert "ai_context" in data
     assert data["ai_context"] == fixed_ai_context
-    assert data["ai_context"]["summary"] == "Test summary for Papa Johns."
-
-    business = (
-        db_session.query(Business)
-        .filter(
-            Business.provider == "google",
-            Business.provider_place_id == place_id,
-        )
-        .first()
-    )
-    assert business is not None
-    assert business.ai_context == fixed_ai_context
-    assert business.ai_context_last_updated is not None
+    assert data["result"]["ai_notes"] == "Test ai notes"
+    assert data["result"]["ai_context"] == fixed_ai_context
 
 
-def test_place_details_returns_200_when_ai_helpers_return_none(client, db_session):
+def test_place_details_when_ai_missing_returns_pending_and_schedules_background_task(client, db_session):
     """
-    GET /places/details when AI helpers return None returns 200 with place details;
-    business.ai_notes and business.ai_context are not updated (remain null).
+    When ai_notes/context are missing, GET /places/details returns quickly with ai_status="pending",
+    includes all non-AI business details, and schedules generate_and_save_business_ai_insights.
+    (TestClient runs background tasks after response, so we assert the mock was called.)
+    """
+    place_id = "ChIJpending123"
+    minimal_result = _minimal_place_result(place_id, name="Place Pending AI")
+
+    mock_user = MagicMock(spec=User)
+    mock_user.id = None
+    mock_user.onboarding_completed_at = datetime.now(timezone.utc)
+    mock_user.onboarding_preferences = None
+    app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    try:
+        with (
+            patch(
+                "app.routers.places._call_google_api",
+                new_callable=AsyncMock,
+                return_value={"status": "OK", "result": minimal_result},
+            ),
+            patch(
+                "app.routers.places.generate_and_save_business_ai_insights",
+            ) as mock_save_insights,
+        ):
+            response = client.get(f"/api/v1/places/details?place_id={place_id}")
+        # Background tasks run synchronously in TestClient
+        mock_save_insights.assert_called_once()
+        call_args = mock_save_insights.call_args[0]
+        assert call_args[1] == minimal_result
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == status.HTTP_200_OK
+    data = response.json()
+    assert data.get("ai_status") == "pending"
+    assert data["result"]["provider_place_id"] == place_id
+    assert data["result"]["name"] == "Place Pending AI"
+    assert data["business_id"] is not None
+
+
+def test_place_details_returns_200_with_pending_when_no_ai_data(client, db_session):
+    """
+    GET /places/details when business has no AI data returns 200 with place details
+    and ai_status="pending"; background task is scheduled (mock prevents real LLM call).
     """
     place_id = "ChIJnone123"
     minimal_result = _minimal_place_result(place_id, name="Place No AI")
@@ -163,11 +187,7 @@ def test_place_details_returns_200_when_ai_helpers_return_none(client, db_sessio
     mock_user.id = None
     mock_user.onboarding_completed_at = datetime.now(timezone.utc)
     mock_user.onboarding_preferences = None
-
-    def override_get_current_user():
-        return mock_user
-
-    app.dependency_overrides[get_current_user] = override_get_current_user
+    app.dependency_overrides[get_current_user] = lambda: mock_user
 
     try:
         with (
@@ -176,39 +196,18 @@ def test_place_details_returns_200_when_ai_helpers_return_none(client, db_sessio
                 new_callable=AsyncMock,
                 return_value={"status": "OK", "result": minimal_result},
             ),
-            patch(
-                "app.routers.places.generate_ai_notes_for_business",
-                return_value=None,
-            ),
-            patch(
-                "app.routers.places.generate_business_ai_context",
-                return_value=None,
-            ),
+            patch("app.routers.places.generate_and_save_business_ai_insights"),
         ):
-            response = client.get(
-                f"/api/v1/places/details?place_id={place_id}",
-            )
+            response = client.get(f"/api/v1/places/details?place_id={place_id}")
     finally:
         app.dependency_overrides.pop(get_current_user, None)
 
     assert response.status_code == status.HTTP_200_OK
     data = response.json()
-    assert "result" in data
     assert data["result"]["provider_place_id"] == place_id
     assert data["result"]["name"] == "Place No AI"
+    assert data.get("ai_status") == "pending"
     assert data.get("ai_context") is None
-
-    business = (
-        db_session.query(Business)
-        .filter(
-            Business.provider == "google",
-            Business.provider_place_id == place_id,
-        )
-        .first()
-    )
-    assert business is not None
-    assert business.ai_notes is None
-    assert business.ai_context is None
 
 
 # --- GET /places/nearby: arbitrary coordinates and validation ---

@@ -1,7 +1,7 @@
 from pydantic import BaseModel, ConfigDict
 from uuid import UUID
 from datetime import datetime
-from typing import Optional, TYPE_CHECKING
+from typing import Literal, Optional, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.schemas.menu_item import MenuItemRead
@@ -60,4 +60,13 @@ class BusinessReadWithItems(BusinessRead):
     scan_sessions: list["ScanSessionRead"] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class BusinessAIInsightsResponse(BaseModel):
+    """Response for GET /businesses/{id}/ai-insights. Frontend polls to know when AI is ready."""
+
+    business_id: UUID
+    ai_status: Literal["ready", "pending", "unavailable", "error"]
+    ai_notes: Optional[str] = None
+    ai_context: Optional[dict[str, Any]] = None
 

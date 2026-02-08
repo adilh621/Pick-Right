@@ -20,7 +20,7 @@ def _minimal_place_data() -> dict:
 
 def test_generate_business_ai_context_returns_none_when_llm_returns_none(db_session):
     """
-    When generate_text_with_system returns None (quota/cooldown),
+    When unified generate_business_ai_insights raises or returns empty,
     generate_business_ai_context returns None.
     """
     business = Business(
@@ -32,7 +32,10 @@ def test_generate_business_ai_context_returns_none_when_llm_returns_none(db_sess
     db_session.commit()
     db_session.refresh(business)
 
-    with patch("app.ai.business_context.generate_text_with_system", return_value=None):
+    with patch(
+        "app.ai.business_context.generate_business_ai_insights",
+        return_value=("", None),
+    ):
         result = generate_business_ai_context(business, _minimal_place_data())
 
     assert result is None
@@ -40,8 +43,8 @@ def test_generate_business_ai_context_returns_none_when_llm_returns_none(db_sess
 
 def test_generate_business_ai_context_prompt_is_generic_no_user_preferences(db_session):
     """
-    The prompt passed to the LLM must not contain user preferences or personalization.
-    AI context is generic (same for all users).
+    The wrapper calls unified generate_business_ai_insights with (business, place_data) only;
+    user_preferences are not passed (AI context is generic for all users).
     """
     business = Business(
         name="Test Restaurant",
@@ -53,18 +56,18 @@ def test_generate_business_ai_context_prompt_is_generic_no_user_preferences(db_s
     db_session.refresh(business)
     place_data = _minimal_place_data()
 
-    with patch("app.ai.business_context.generate_text_with_system") as mock_llm:
-        mock_llm.return_value = '{"summary": "A place.", "pros": [], "cons": [], "best_for_user_profile": "Anyone.", "vibe": "Casual", "reliability_notes": "", "source_notes": ""}'
+    with patch("app.ai.business_context.generate_business_ai_insights") as mock_insights:
+        mock_insights.return_value = (
+            "Some notes",
+            {"summary": "A place.", "vibe": "Casual", "pros": [], "cons": []},
+        )
         generate_business_ai_context(business, place_data, None)
         generate_business_ai_context(business, place_data, {"diet": "vegetarian", "budget": "low"})
 
-    assert mock_llm.call_count >= 1
-    for call in mock_llm.call_args_list:
-        user_prompt = call.args[0]
-        assert isinstance(user_prompt, str)
-        # Must not include user preferences or their values (AI context is generic)
-        assert "User onboarding preferences" not in user_prompt
-        assert "vegetarian" not in user_prompt
-        assert "low" not in user_prompt
-        assert "generic" in user_prompt.lower()
-        assert "best_for_user_profile" in user_prompt
+    assert mock_insights.call_count == 2
+    for call in mock_insights.call_args_list:
+        # Only (business, place_data) are passed; no user_preferences
+        args = call[0]
+        assert len(args) == 2
+        assert args[0] is business
+        assert args[1] == place_data

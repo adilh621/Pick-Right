@@ -5,7 +5,7 @@ import re
 import traceback
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 import httpx
 from sqlalchemy.orm import Session
@@ -15,9 +15,12 @@ from app.core.auth import get_current_user, require_onboarding
 from app.db.session import get_db
 from app.models.user import User
 from app.models.business import Business
-from app.services.ai_notes_service import generate_ai_notes_for_business
-from app.ai.business_context import generate_business_ai_context
+from app.db.session import SessionLocal
+from app.services.business_ai_insights import generate_and_save_business_ai_insights
 import math
+
+# Number of top nearby results to pre-warm with AI insights (best-effort)
+NEARBY_PREWARM_N = 5
 
 from app.schemas.places import (
     NearbySearchResponse,
@@ -231,6 +234,47 @@ def _normalize_place_details(
     )
 
 
+def _fetch_place_details_sync(place_id: str) -> dict | None:
+    """
+    Synchronously fetch Google Place Details. Used by background pre-warm only.
+    Returns parsed JSON or None on failure. Does not raise.
+    """
+    try:
+        api_key = _get_api_key()
+        url = f"{GOOGLE_PLACES_BASE}/details/json"
+        params = {
+            "place_id": place_id,
+            "fields": ",".join([
+                "place_id",
+                "name",
+                "types",
+                "rating",
+                "user_ratings_total",
+                "formatted_address",
+                "formatted_phone_number",
+                "website",
+                "opening_hours",
+                "photos",
+                "geometry",
+                "address_components",
+                "reviews",
+                "price_level",
+            ]),
+            "key": api_key,
+        }
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.get(url, params=params)
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        if data.get("status") != "OK" or not data.get("result"):
+            return None
+        return data
+    except Exception as e:
+        logger.warning("Sync place details fetch failed for place_id=%s: %s", place_id, e)
+        return None
+
+
 async def _call_google_api(url: str, params: dict) -> dict:
     """
     Call Google Places API with logging and error handling.
@@ -303,12 +347,45 @@ LAT_MIN, LAT_MAX = -90.0, 90.0
 LNG_MIN, LNG_MAX = -180.0, 180.0
 
 
+def _prewarm_ai_insights_for_place_ids(place_ids: list[str]) -> None:
+    """
+    Best-effort background task: for each place_id fetch details, upsert business,
+    and schedule AI insights generation if missing/stale. Failures are logged and skipped.
+    """
+    for place_id in place_ids:
+        try:
+            data = _fetch_place_details_sync(place_id)
+            if not data or not data.get("result"):
+                continue
+            result = data["result"]
+            db = SessionLocal()
+            try:
+                business = _upsert_business_from_place(db, place_id, result)
+                now_utc = datetime.now(timezone.utc)
+                last_updated = business.ai_context_last_updated
+                if last_updated is not None and last_updated.tzinfo is None:
+                    last_updated = last_updated.replace(tzinfo=timezone.utc)
+                needs_ai = (
+                    not (business.ai_notes and business.ai_notes.strip())
+                    or business.ai_context is None
+                    or last_updated is None
+                    or (now_utc - last_updated) > timedelta(hours=AI_CONTEXT_TTL_HOURS)
+                )
+                if needs_ai:
+                    generate_and_save_business_ai_insights(business.id, result)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("Prewarm AI failed for place_id=%s: %s", place_id, e, exc_info=True)
+
+
 @router.get("/nearby", response_model=NearbySearchResponse)
 async def nearby_search(
     lat: float = Query(..., ge=LAT_MIN, le=LAT_MAX, description="Latitude (-90 to 90)"),
     lng: float = Query(..., ge=LNG_MIN, le=LNG_MAX, description="Longitude (-180 to 180)"),
     radius: int = Query(1500, ge=1, le=50000, description="Search radius in meters"),
     type: str = Query("restaurant", description="Place type to search for"),
+    background_tasks: BackgroundTasks = None,
     current_user: User = Depends(get_current_user),
 ) -> NearbySearchResponse:
     """
@@ -351,11 +428,22 @@ async def nearby_search(
             }
         )
     
+    raw_results = data.get("results", [])
     results = [
         _normalize_nearby_place(place)
-        for place in data.get("results", [])
+        for place in raw_results
     ]
-    
+
+    # Optional pre-warm: schedule AI insights for top N (best-effort, does not block response)
+    if background_tasks is not None:
+        place_ids = [
+            p.get("place_id")
+            for p in raw_results[:NEARBY_PREWARM_N]
+            if p.get("place_id")
+        ]
+        if place_ids:
+            background_tasks.add_task(_prewarm_ai_insights_for_place_ids, place_ids)
+
     return NearbySearchResponse(results=results)
 
 
@@ -424,6 +512,7 @@ AI_CONTEXT_TTL_HOURS = 24
 @router.get("/details", response_model=PlaceDetailsResponse)
 async def place_details(
     place_id: str = Query(..., description="Google Place ID"),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> PlaceDetailsResponse:
@@ -433,13 +522,13 @@ async def place_details(
     Requires authentication and completed onboarding.
 
     - Upserts a business row (by place_id).
-    - Generates and caches ai_notes if missing.
-    - Generates and caches structured AI context (ai_context) if missing or older than 24h;
-      ai_context is generic (no per-user personalization).
-    - Returns business_id so the client can use it for the chat endpoint.
+    - Returns quickly with place details; AI insights (ai_notes, ai_context) are included
+      when already cached and fresh (< 24h). Otherwise ai_status is "pending" and
+      generation runs in the background.
+    - Returns business_id and ai_status so the client can poll GET /businesses/{id}/ai-insights.
 
-    Returns normalized place details including hours, contact info, photos, ai_notes,
-    business_id, and ai_context.
+    Returns normalized place details including hours, contact info, photos, ai_notes
+    and ai_context when ready, and ai_status (ready | pending | unavailable).
     """
     require_onboarding(current_user)
     api_key = _get_api_key()
@@ -499,36 +588,32 @@ async def place_details(
     # Upsert business so we can cache ai_notes and ai_context
     business = _upsert_business_from_place(db, place_id, result)
 
-    # Generate and cache ai_notes if missing
-    ai_notes = business.ai_notes
-    if not (ai_notes and ai_notes.strip()):
-        try:
-            generated = generate_ai_notes_for_business(business, result)
-            if generated and generated.strip():
-                business.ai_notes = generated
-                db.commit()
-                db.refresh(business)
-                ai_notes = business.ai_notes
-        except Exception as e:
-            logger.exception("Failed to generate ai_notes for business %s: %s", business.id, e)
-            ai_notes = None
-
-    # Decide whether to regenerate AI context (Option B: null or older than TTL)
     now_utc = datetime.now(timezone.utc)
-    need_ai_context = (
-        business.ai_context is None
-        or business.ai_context_last_updated is None
-        or (now_utc - business.ai_context_last_updated) > timedelta(hours=AI_CONTEXT_TTL_HOURS)
+    last_updated = business.ai_context_last_updated
+    if last_updated is not None and last_updated.tzinfo is None:
+        last_updated = last_updated.replace(tzinfo=timezone.utc)
+    has_fresh_ai = (
+        business.ai_notes
+        and business.ai_notes.strip()
+        and business.ai_context is not None
+        and last_updated is not None
+        and (now_utc - last_updated) <= timedelta(hours=AI_CONTEXT_TTL_HOURS)
     )
-    if need_ai_context:
-        ai_context_dict = generate_business_ai_context(business, result, None)
-        if ai_context_dict is not None:
-            business.ai_context = ai_context_dict
-            business.ai_context_last_updated = now_utc
-            db.commit()
-            db.refresh(business)
 
-    ai_context = business.ai_context
+    if has_fresh_ai:
+        ai_status = "ready"
+        ai_notes = business.ai_notes
+        ai_context = business.ai_context
+    else:
+        ai_notes = business.ai_notes if (business.ai_notes and business.ai_notes.strip()) else None
+        ai_context = business.ai_context
+        ai_status = "pending"
+        if background_tasks is not None:
+            background_tasks.add_task(
+                generate_and_save_business_ai_insights,
+                business.id,
+                result,
+            )
 
     return PlaceDetailsResponse(
         result=_normalize_place_details(
@@ -539,6 +624,7 @@ async def place_details(
         ),
         business_id=business.id,
         ai_context=ai_context,
+        ai_status=ai_status,
     )
 
 

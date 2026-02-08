@@ -1,9 +1,9 @@
 """Schemas for Google Places API proxy responses."""
 
 from uuid import UUID
+from typing import Literal, Optional, Any
 
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, Any
 
 
 class PlaceResult(BaseModel):
@@ -95,10 +95,11 @@ class PlaceDetails(BaseModel):
 
 
 class PlaceDetailsResponse(BaseModel):
-    """Response for place details endpoint. Top-level business_id and ai_context for client decoding."""
+    """Response for place details endpoint. Top-level business_id, ai_context, and ai_status for client decoding."""
     result: PlaceDetails
     business_id: Optional[UUID] = None
     ai_context: Optional[dict[str, Any]] = None
+    ai_status: Literal["ready", "pending", "unavailable"] = "ready"
 
     model_config = ConfigDict(serialization_exclude_none=True)
 

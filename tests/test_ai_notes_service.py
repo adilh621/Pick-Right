@@ -20,7 +20,7 @@ def _minimal_place_data() -> dict:
 
 def test_generate_ai_notes_returns_none_when_llm_returns_none(db_session):
     """
-    When generate_text_with_system returns None (quota/cooldown),
+    When unified generate_business_ai_insights raises or returns empty,
     generate_ai_notes_for_business returns None and does not raise.
     """
     business = Business(
@@ -32,7 +32,10 @@ def test_generate_ai_notes_returns_none_when_llm_returns_none(db_session):
     db_session.commit()
     db_session.refresh(business)
 
-    with patch("app.services.ai_notes_service.generate_text_with_system", return_value=None):
+    with patch(
+        "app.services.ai_notes_service.generate_business_ai_insights",
+        return_value=(None, {}),
+    ):
         result = generate_ai_notes_for_business(business, _minimal_place_data())
 
     assert result is None
