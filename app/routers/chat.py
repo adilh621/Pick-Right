@@ -24,7 +24,7 @@ from app.db.session import get_db
 from app.models.business import Business
 from app.models.user import User
 from app.routers.ai import _build_user_content_with_history
-from app.services.gemini_client import generate_text_with_system_chat
+from app.services.gemini_client import generate_business_chat_with_search
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,13 @@ Your job:
 - Use only concrete details from the business context; do not guess or invent.
 - Stay on-topic: the user is asking about THIS business. Do not suggest other places unless they explicitly ask.
 - When distance_miles or user_distance_note is present in the context, use it for distance and "how long will it take" questions. You may give rough walking (~3 mph) and driving (~20–25 mph) time estimates; label them as approximate.
-- Answer in concise markdown, friendly but not overly verbose."""
+- Answer in concise markdown, friendly but not overly verbose.
+
+Google Search (web search):
+- You MAY use Google Search when the business context and user_profile do NOT contain the needed information (e.g. "when was this location established?", "is there a mosque nearby?", "what time is the Friday khutbah?").
+- Priorities: (1) Use the provided business JSON and user_profile JSON as the primary source. (2) If the context is silent on the question, you MAY use web search, using the business name, address, category, and city/state as search hints. (3) Never contradict the business context; if web search conflicts with our data, business data wins. (4) If neither context nor search can answer, say so clearly and recommend the user contact the business directly.
+- Attribution: When a statement is based on web search, say so explicitly (e.g. "Based on web search results, it appears that…"). When from our data, you may say "From your business profile…" or similar. Never present web search results as if they came from our business context.
+- If both business context and web search fail to provide a reliable answer, respond with a short explanation that you don't have the information and suggest contacting the business directly. Never invent dates, prices, or allergy information. If the user asks something clearly unrelated to the business or their preferences, politely refuse."""
 
 
 def build_business_chat_context(
@@ -191,7 +197,10 @@ def chat_business(
     )
 
     try:
-        result = generate_text_with_system_chat(user_content, system_instruction)
+        result = generate_business_chat_with_search(
+            system_prompt=system_instruction,
+            messages=[{"role": "user", "content": user_content}],
+        )
     except ValueError as e:
         logger.error("Chat Gemini config error: %s", e)
         raise HTTPException(status_code=500, detail={"error": str(e)})

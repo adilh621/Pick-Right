@@ -244,3 +244,80 @@ def generate_text_with_system_chat(prompt: str, system_instruction: str) -> Opti
             )
             return None
         raise
+
+
+def generate_business_chat_with_search(
+    system_prompt: str,
+    messages: list[dict],
+) -> Optional[str]:
+    """
+    Generate a chat response using Gemini with Google Search grounding as fallback.
+    Used for the business chat endpoint when the answer may not be in local context.
+
+    Uses GEMINI_API_KEY2. On 429, sets chat cooldown and returns None.
+    The model can use google_search tool when the provided context doesn't contain
+    the answer; it returns final text after any internal tool use.
+
+    Args:
+        system_prompt: System instruction for the model.
+        messages: List of message dicts with "role" (user/model) and "content".
+                  Typically one user message containing context JSON + history + question.
+
+    Returns:
+        The generated text response, or None on quota exceeded / cooldown.
+    """
+    global _quota_cooldown_until_chat
+
+    if _should_skip_due_to_quota_chat():
+        logger.debug(
+            "Skipping Gemini business chat (search) due to recent quota exceeded; still in cooldown"
+        )
+        return None
+
+    if not messages:
+        return None
+
+    # Extract user content: we expect a single user message with context + history + question
+    user_content = messages[0].get("content", "") if messages else ""
+    if not user_content:
+        return None
+
+    try:
+        client = _get_client_chat()
+        model = settings.gemini_model
+        grounding_tool = genai.types.Tool(google_search=genai.types.GoogleSearch())
+
+        logger.info(
+            "Calling Gemini business chat (search) model=%s, prompt_length=%s",
+            model,
+            len(user_content),
+        )
+
+        response = client.models.generate_content(
+            model=model,
+            contents=user_content,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=[grounding_tool],
+            ),
+        )
+
+        result = response.text
+        logger.info(
+            "Gemini business chat (search) response_length=%s",
+            len(result) if result else 0,
+        )
+        return result
+
+    except genai_errors.ClientError as e:
+        if _is_quota_error(e):
+            retry_sec = _extract_retry_delay_seconds(e)
+            cooldown_sec = retry_sec if retry_sec is not None else settings.gemini_quota_cooldown_seconds
+            _quota_cooldown_until_chat = datetime.now(timezone.utc) + timedelta(seconds=cooldown_sec)
+            logger.warning(
+                "Gemini business chat (search) quota exceeded; model=%s cooldown=%s s",
+                settings.gemini_model,
+                cooldown_sec,
+            )
+            return None
+        raise
