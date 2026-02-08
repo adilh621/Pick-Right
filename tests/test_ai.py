@@ -3,7 +3,7 @@
 import pytest
 from datetime import datetime, timezone
 from uuid import UUID
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from app.models.user import User
 from app.models.business import Business
@@ -158,3 +158,163 @@ def test_chat_rejects_invalid_longitude(client, mock_jwks, create_test_token, db
     assert resp.status_code == 422
     detail = resp.json().get("detail", [])
     assert any("longitude" in str(d).lower() for d in (detail if isinstance(detail, list) else [detail]))
+
+
+# --- Main chat (no business_id): location_hint and recommended_places ---
+
+
+def test_main_chat_with_location_hint_includes_area_in_prompt(client, mock_jwks, create_test_token):
+    """Main chat (no business_id) with location_hint passes area to Gemini and returns reply."""
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    with patch("app.routers.ai.generate_text_with_system") as mock_gen:
+        mock_gen.return_value = "Here are some gyms around Queens, NY."
+        resp = client.post(
+            "/api/v1/ai/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "message": "Find me good gyms near me",
+                "location_hint": "Queens, NY",
+            },
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["reply"] == "Here are some gyms around Queens, NY."
+    assert mock_gen.called
+    call_args = mock_gen.call_args
+    system_instruction = call_args[0][1]
+    assert "Queens, NY" in system_instruction
+    assert "area_hint" in system_instruction or "user_location_context" in system_instruction
+    assert data.get("recommended_places") is None
+
+
+def test_main_chat_without_location_hint_returns_fixed_message_without_calling_gemini(client, mock_jwks, create_test_token):
+    """Main chat (no business_id) without location_hint returns no-location message and does not call Gemini."""
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    with patch("app.routers.ai.generate_text_with_system") as mock_gen:
+        resp = client.post(
+            "/api/v1/ai/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"message": "Find me good gyms"},
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "location" in data["reply"].lower()
+    assert "don't have your location" in data["reply"] or "setting or changing your location" in data["reply"]
+    assert not mock_gen.called
+
+
+def test_main_chat_empty_location_hint_treated_as_missing(client, mock_jwks, create_test_token):
+    """Main chat with location_hint empty string is treated as missing; returns no-location message."""
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    with patch("app.routers.ai.generate_text_with_system") as mock_gen:
+        resp = client.post(
+            "/api/v1/ai/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"message": "Find gyms", "location_hint": ""},
+        )
+
+    assert resp.status_code == 200
+    assert "location" in resp.json()["reply"].lower()
+    assert not mock_gen.called
+
+
+def test_main_chat_places_query_includes_recommended_places(client, mock_jwks, create_test_token):
+    """Place-like query with lat/lng calls Google Places with same radius as /places/nearby and returns recommended_places."""
+    from app.services.places_client import DEFAULT_NEARBY_RADIUS_M
+
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    lat, lng = 40.7282, -73.7949
+    fake_places = [
+        {"place_id": "ChIJ-bjj-1", "name": "Queens BJJ"},
+        {"place_id": "ChIJ-bjj-2", "name": "Brooklyn Grappling"},
+        {"place_id": "ChIJ-bjj-3", "name": "NYC Combat"},
+    ]
+
+    with patch("app.routers.ai.generate_text_with_system") as mock_gen:
+        mock_gen.return_value = "Here are some BJJ gyms near you. Check the options below."
+        with patch("app.routers.ai.search_places_text", new_callable=AsyncMock) as mock_places:
+            mock_places.return_value = fake_places
+            resp = client.post(
+                "/api/v1/ai/chat",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "message": "What are the best bjj gyms around me?",
+                    "location_hint": "Queens, NY",
+                    "latitude": lat,
+                    "longitude": lng,
+                },
+            )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert mock_gen.called
+    # Places call uses request coords and same default radius as GET /places/nearby
+    assert mock_places.called
+    call_kw = mock_places.call_args.kwargs
+    assert call_kw["query"] == "Brazilian Jiu-Jitsu gym"
+    assert call_kw["lat"] == lat
+    assert call_kw["lng"] == lng
+    assert call_kw["radius_m"] == DEFAULT_NEARBY_RADIUS_M
+    assert data["recommended_places"] is not None
+    assert len(data["recommended_places"]) == 3
+    assert data["recommended_places"][0]["name"] == "Queens BJJ" and data["recommended_places"][0]["place_id"] == "ChIJ-bjj-1"
+    assert data["recommended_places"][1]["name"] == "Brooklyn Grappling"
+    assert data["recommended_places"][2]["name"] == "NYC Combat"
+
+
+def test_main_chat_non_place_query_has_no_recommended_places(client, mock_jwks, create_test_token):
+    """Non-place question returns no recommended_places even with location."""
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    with patch("app.routers.ai.generate_text_with_system") as mock_gen:
+        mock_gen.return_value = "Sorry, I can only help with places near you."
+        resp = client.post(
+            "/api/v1/ai/chat",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "message": "What is 2+2?",
+                "location_hint": "Queens, NY",
+                "latitude": 40.7282,
+                "longitude": -73.7949,
+            },
+        )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data.get("recommended_places") is None or data.get("recommended_places") == []
+
+
+def test_main_chat_place_query_without_coords_skips_places_call(client, mock_jwks, create_test_token):
+    """When latitude or longitude is missing, we do not call search_places_text."""
+    token = create_test_token()
+    client.get("/api/v1/me", headers={"Authorization": f"Bearer {token}"})
+
+    with patch("app.routers.ai.generate_text_with_system") as mock_gen:
+        mock_gen.return_value = "Here are some cafes to work from."
+        with patch("app.routers.ai.search_places_text", new_callable=AsyncMock) as mock_places:
+            resp = client.post(
+                "/api/v1/ai/chat",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "message": "Cafes to work from",
+                    "location_hint": "Queens, NY",
+                    # no latitude / longitude
+                },
+            )
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert mock_gen.called
+    assert not mock_places.called
+    assert data.get("recommended_places") is None

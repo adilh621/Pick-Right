@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 GOOGLE_PLACES_BASE = "https://maps.googleapis.com/maps/api/place"
 REQUEST_TIMEOUT = 10.0
 
+# Same default radius as GET /api/v1/places/nearby (Query default 1500)
+DEFAULT_NEARBY_RADIUS_M = 1500
+
 
 def _redact_api_key(url: str) -> str:
     """Remove API key from URL for safe logging."""
@@ -44,6 +47,48 @@ async def _call_google_api(url: str, params: dict) -> dict:
             raise Exception(f"Google API HTTP {response.status_code}: {truncated_body}")
         
         return response.json()
+
+
+async def search_places_text(
+    query: str,
+    lat: float | None = None,
+    lng: float | None = None,
+    radius_m: int = DEFAULT_NEARBY_RADIUS_M,
+    limit: int = 20,
+) -> list[dict]:
+    """
+    Search for places by text query using Google Places Text Search API.
+    Returns a list of place dicts with at least place_id and name (and raw fields from Google).
+    Uses the same default radius as GET /api/v1/places/nearby when lat/lng are provided.
+
+    Used by the AI router for recommended_places and by the places router for GET /search.
+    """
+    api_key = _get_api_key()
+    url = f"{GOOGLE_PLACES_BASE}/textsearch/json"
+    params: dict = {
+        "query": query,
+        "key": api_key,
+    }
+    if lat is not None and lng is not None:
+        params["location"] = f"{lat},{lng}"
+        params["radius"] = radius_m
+
+    try:
+        data = await _call_google_api(url, params)
+        status = data.get("status", "UNKNOWN_ERROR")
+        if status not in ("OK", "ZERO_RESULTS"):
+            logger.error("Text search error: status=%s, query=%s", status, query)
+            return []
+        results = data.get("results", [])[:limit]
+        out = [{"place_id": p.get("place_id"), "name": p.get("name", "")} for p in results if p.get("place_id")]
+        logger.debug(
+            "search_places_text: query=%r, lat=%s, lng=%s, radius_m=%s, results_count=%s",
+            query, lat, lng, radius_m, len(out),
+        )
+        return out
+    except Exception as e:
+        logger.error("search_places_text failed: %s\n%s", e, traceback.format_exc())
+        return []
 
 
 async def text_search(query: str, location_hint: str | None = None) -> dict | None:
