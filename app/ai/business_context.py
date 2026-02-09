@@ -32,7 +32,7 @@ def generate_business_ai_context(
         Dict suitable for Business.ai_context (JSONB), or None on LLM failure.
     """
     try:
-        _, context = generate_business_ai_insights(business, place_data)
+        _, context, _ = generate_business_ai_insights(business, place_data)
         return context if context else None
     except Exception as e:
         logger.exception("generate_business_ai_context failed for business %s: %s", business.id, e)

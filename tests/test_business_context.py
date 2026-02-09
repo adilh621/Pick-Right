@@ -34,7 +34,7 @@ def test_generate_business_ai_context_returns_none_when_llm_returns_none(db_sess
 
     with patch(
         "app.ai.business_context.generate_business_ai_insights",
-        return_value=("", None),
+        return_value=("", None, []),
     ):
         result = generate_business_ai_context(business, _minimal_place_data())
 
@@ -60,6 +60,7 @@ def test_generate_business_ai_context_prompt_is_generic_no_user_preferences(db_s
         mock_insights.return_value = (
             "Some notes",
             {"summary": "A place.", "vibe": "Casual", "pros": [], "cons": []},
+            [],
         )
         generate_business_ai_context(business, place_data, None)
         generate_business_ai_context(business, place_data, {"diet": "vegetarian", "budget": "low"})

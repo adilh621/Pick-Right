@@ -19,8 +19,8 @@ from app.db.session import SessionLocal
 from app.services.business_ai_insights import generate_and_save_business_ai_insights
 import math
 
-# Number of top nearby results to pre-warm with AI insights (best-effort)
-NEARBY_PREWARM_N = 5
+# Max businesses to prewarm per request (cap to avoid runaway background jobs)
+PREWARM_CAP = 15
 
 from app.schemas.places import (
     NearbySearchResponse,
@@ -76,6 +76,14 @@ def _extract_state_from_address_components(place: dict) -> str | None:
         if "administrative_area_level_1" in (comp.get("types") or []):
             return comp.get("long_name") or comp.get("short_name")
     return None
+
+
+def _extract_first_photo_reference(place: dict) -> str | None:
+    """Extract first photo reference from Google Place result for persistence."""
+    photos = place.get("photos") or []
+    if not photos:
+        return None
+    return photos[0].get("photo_reference") or None
 
 
 def _extract_primary_type(place: dict) -> str | None:
@@ -347,10 +355,66 @@ LAT_MIN, LAT_MAX = -90.0, 90.0
 LNG_MIN, LNG_MAX = -180.0, 180.0
 
 
+async def _fetch_nearby_places_async(
+    lat: float, lng: float, radius: int, type_: str
+) -> tuple[list[PlaceResult], list[str]]:
+    """
+    Fetch nearby places from Google for a given type. Used by home feed.
+    Returns (normalized PlaceResult list, place_ids for prewarm). On API error, returns ([], []).
+    """
+    try:
+        api_key = _get_api_key()
+    except HTTPException:
+        return ([], [])
+    url = f"{GOOGLE_PLACES_BASE}/nearbysearch/json"
+    params = {
+        "location": f"{lat},{lng}",
+        "radius": radius,
+        "type": type_,
+        "key": api_key,
+    }
+    try:
+        data = await _call_google_api(url, params)
+    except HTTPException as e:
+        logger.warning("Home feed nearby fetch failed for type=%s: %s", type_, e.detail)
+        return ([], [])
+    status = data.get("status", "UNKNOWN_ERROR")
+    if status not in ("OK", "ZERO_RESULTS"):
+        logger.warning("Google nearby status %s for type=%s", status, type_)
+        return ([], [])
+    raw_results = data.get("results", [])
+    place_ids = [p.get("place_id") for p in raw_results if p.get("place_id")]
+    results = [_normalize_nearby_place(p) for p in raw_results]
+    return (results, place_ids)
+
+
+def prewarm_insights_for_places(
+    background_tasks: BackgroundTasks,
+    places: list[PlaceResult],
+) -> None:
+    """
+    Schedule background prewarm of AI insights for up to PREWARM_CAP places.
+    Extracts place_ids from PlaceResult list, caps the list, and adds a single
+    task that fetches details, upserts businesses, and runs AI generation when needed.
+    Non-blocking; response must not wait on Gemini.
+    """
+    place_ids = [p.provider_place_id for p in places if p.provider_place_id]
+    if not place_ids:
+        return
+    if len(place_ids) > PREWARM_CAP:
+        logger.info(
+            "Prewarm cap: limiting from %d to %d place_ids for this request",
+            len(place_ids),
+            PREWARM_CAP,
+        )
+        place_ids = place_ids[:PREWARM_CAP]
+    background_tasks.add_task(_prewarm_ai_insights_for_place_ids, place_ids)
+
+
 def _prewarm_ai_insights_for_place_ids(place_ids: list[str]) -> None:
     """
     Best-effort background task: for each place_id fetch details, upsert business,
-    and schedule AI insights generation if missing/stale. Failures are logged and skipped.
+    and run AI insights generation if missing/stale (same TTL as details). Failures are logged and skipped.
     """
     for place_id in place_ids:
         try:
@@ -434,15 +498,9 @@ async def nearby_search(
         for place in raw_results
     ]
 
-    # Optional pre-warm: schedule AI insights for top N (best-effort, does not block response)
-    if background_tasks is not None:
-        place_ids = [
-            p.get("place_id")
-            for p in raw_results[:NEARBY_PREWARM_N]
-            if p.get("place_id")
-        ]
-        if place_ids:
-            background_tasks.add_task(_prewarm_ai_insights_for_place_ids, place_ids)
+    # Proactive prewarm: upsert + AI insights for places missing/stale (capped, non-blocking)
+    if background_tasks is not None and results:
+        prewarm_insights_for_places(background_tasks, results)
 
     return NearbySearchResponse(results=results)
 
@@ -461,6 +519,8 @@ def _upsert_business_from_place(db: Session, place_id: str, result: dict) -> Bus
     formatted_address = result.get("formatted_address")
     state = _extract_state_from_address_components(result)
     category = _extract_primary_type(result)
+    photo_ref = _extract_first_photo_reference(result)
+    photo_url = _build_photo_url(photo_ref) if photo_ref else None
 
     # Look up by (provider, provider_place_id) to match DB unique constraint
     business = (
@@ -482,6 +542,8 @@ def _upsert_business_from_place(db: Session, place_id: str, result: dict) -> Bus
         business.lng = lng
         business.category = category
         business.external_id_google = place_id
+        business.photo_reference = photo_ref
+        business.photo_url = photo_url
         db.commit()
         db.refresh(business)
         return business
@@ -498,6 +560,8 @@ def _upsert_business_from_place(db: Session, place_id: str, result: dict) -> Bus
         lat=lat,
         lng=lng,
         category=category,
+        photo_reference=photo_ref,
+        photo_url=photo_url,
     )
     db.add(business)
     db.commit()

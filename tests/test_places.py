@@ -10,12 +10,15 @@ from app.core.auth import get_current_user
 from app.main import app
 from app.models.business import Business
 from app.models.user import User
-from app.routers.places import _upsert_business_from_place
+from app.routers.places import (
+    _upsert_business_from_place,
+    PREWARM_CAP,
+)
 
 
-def _minimal_place_result(place_id: str, name: str = "Test Place") -> dict:
+def _minimal_place_result(place_id: str, name: str = "Test Place", with_photos: bool = False) -> dict:
     """Minimal Google Place Details-style result for testing."""
-    return {
+    out = {
         "place_id": place_id,
         "name": name,
         "formatted_address": "123 Test St, City",
@@ -23,6 +26,9 @@ def _minimal_place_result(place_id: str, name: str = "Test Place") -> dict:
         "address_components": [],
         "types": ["restaurant"],
     }
+    if with_photos:
+        out["photos"] = [{"photo_reference": "ref_abc123"}]
+    return out
 
 
 def test_upsert_business_from_place_twice_same_place_id_no_integrity_error(db_session):
@@ -333,3 +339,104 @@ def test_places_nearby_different_coordinates_produce_different_results(client, m
     ]
     assert "40.7128,-74.006" in locations_called[0]
     assert "51.5074,-0.1278" in locations_called[1]
+
+
+def test_places_nearby_schedules_prewarm_when_results_returned(client, mock_jwks, create_test_token):
+    """When nearby returns places, prewarm_insights_for_places is called with those results (non-blocking)."""
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400c5", email="prewarm@example.com")
+    _complete_onboarding(client, token)
+
+    raw = {
+        "status": "OK",
+        "results": [
+            {"place_id": "pid_1", "name": "Place 1", "vicinity": "Addr 1", "geometry": {"location": {"lat": 40.7, "lng": -74.0}}, "types": ["cafe"]},
+            {"place_id": "pid_2", "name": "Place 2", "vicinity": "Addr 2", "geometry": {"location": {"lat": 40.71, "lng": -74.01}}, "types": ["cafe"]},
+        ],
+    }
+
+    with (
+        patch("app.routers.places._call_google_api", new_callable=AsyncMock, return_value=raw),
+        patch("app.routers.places.prewarm_insights_for_places") as mock_prewarm,
+    ):
+        response = client.get(
+            "/api/v1/places/nearby",
+            params={"lat": 40.7128, "lng": -74.0060},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == status.HTTP_200_OK
+    mock_prewarm.assert_called_once()
+    call_args = mock_prewarm.call_args[0]
+    assert call_args[1]  # places list
+    assert len(call_args[1]) == 2
+    assert call_args[1][0].provider_place_id == "pid_1"
+    assert call_args[1][1].provider_place_id == "pid_2"
+
+
+def test_places_nearby_prewarm_capped(client, mock_jwks, create_test_token):
+    """When nearby returns more than PREWARM_CAP places, _prewarm_ai_insights_for_place_ids receives only PREWARM_CAP."""
+    token = create_test_token(sub="550e8400-e29b-41d4-a716-4466554400c6", email="cap@example.com")
+    _complete_onboarding(client, token)
+
+    n = PREWARM_CAP + 5
+    raw = {
+        "status": "OK",
+        "results": [
+            {
+                "place_id": f"pid_{i}",
+                "name": f"Place {i}",
+                "vicinity": "Addr",
+                "geometry": {"location": {"lat": 40.7, "lng": -74.0}},
+                "types": ["cafe"],
+            }
+            for i in range(n)
+        ],
+    }
+
+    with (
+        patch("app.routers.places._call_google_api", new_callable=AsyncMock, return_value=raw),
+        patch("app.routers.places._prewarm_ai_insights_for_place_ids") as mock_task,
+    ):
+        response = client.get(
+            "/api/v1/places/nearby",
+            params={"lat": 40.7128, "lng": -74.0060},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert response.status_code == status.HTTP_200_OK
+    mock_task.assert_called_once()
+    place_ids = mock_task.call_args[0][0]
+    assert len(place_ids) == PREWARM_CAP
+    assert place_ids[0] == "pid_0"
+
+
+def test_upsert_business_from_place_persists_photo(db_session):
+    """When place result has photos, upsert persists photo_reference and photo_url."""
+    place_id = "ChIJ-photo-test"
+    result = _minimal_place_result(place_id, name="Photo Place", with_photos=True)
+    business = _upsert_business_from_place(db_session, place_id, result)
+    assert business.photo_reference == "ref_abc123"
+    assert business.photo_url is not None
+    assert "photo_reference=ref_abc123" in business.photo_url or "ref_abc123" in business.photo_url
+
+
+def test_prewarm_skips_business_with_fresh_ai(db_session):
+    """When a business already has fresh ai_context, _prewarm_ai_insights_for_place_ids does not call generate_and_save."""
+    from app.routers.places import _prewarm_ai_insights_for_place_ids
+
+    place_id = "ChIJ-fresh-ai"
+    result = _minimal_place_result(place_id, name="Fresh AI Place")
+    business = _upsert_business_from_place(db_session, place_id, result)
+    business.ai_notes = "Cached notes"
+    business.ai_context = {"summary": "Cached"}
+    business.ai_context_last_updated = datetime.now(timezone.utc)
+    db_session.commit()
+    db_session.refresh(business)
+
+    with (
+        patch("app.db.session.SessionLocal", return_value=db_session),
+        patch.object(db_session, "close"),
+        patch("app.routers.places._fetch_place_details_sync", return_value={"status": "OK", "result": result}),
+        patch("app.routers.places.generate_and_save_business_ai_insights") as mock_save,
+    ):
+        _prewarm_ai_insights_for_place_ids([place_id])
+
+    mock_save.assert_not_called()

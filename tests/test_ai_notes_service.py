@@ -34,7 +34,7 @@ def test_generate_ai_notes_returns_none_when_llm_returns_none(db_session):
 
     with patch(
         "app.services.ai_notes_service.generate_business_ai_insights",
-        return_value=(None, {}),
+        return_value=(None, {}, []),
     ):
         result = generate_ai_notes_for_business(business, _minimal_place_data())
 

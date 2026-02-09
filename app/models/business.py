@@ -22,8 +22,11 @@ class Business(Base):
     latitude = Column(Float, nullable=True)  # DOUBLE PRECISION, from Google Places (iOS/Supabase)
     longitude = Column(Float, nullable=True)  # DOUBLE PRECISION, from Google Places (iOS/Supabase)
     category = Column(String, nullable=True)
+    photo_reference = Column(String, nullable=True)  # Google Places first photo reference for card image
+    photo_url = Column(String, nullable=True)  # Precomputed photo URL (from _build_photo_url) for home-feed/details
     ai_notes = Column(Text, nullable=True)  # AI-generated summary for chat context (top items, halal, etc.)
     ai_context = Column(JSONB, nullable=True)  # Structured LLM snapshot for business detail / AI context
+    ai_tags = Column(JSONB, nullable=True)  # AI-generated tags for home feed sections (e.g. ["date-night", "coffee"])
     ai_context_last_updated = Column(DateTime(timezone=True), nullable=True)  # TTL for when to regenerate
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 

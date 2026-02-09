@@ -27,7 +27,7 @@ def generate_ai_notes_for_business(business: Business, place_data: dict) -> Opti
         Concise summary string, or None on LLM failure.
     """
     try:
-        notes, _ = generate_business_ai_insights(business, place_data)
+        notes, _, _ = generate_business_ai_insights(business, place_data)
         return notes if notes else None
     except Exception as e:
         logger.exception("generate_ai_notes_for_business failed for business %s: %s", business.id, e)

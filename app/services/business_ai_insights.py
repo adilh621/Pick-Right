@@ -17,9 +17,15 @@ from app.services.gemini_client import generate_text_with_system
 
 logger = logging.getLogger(__name__)
 
+# Fixed vocabulary for AI tags (home feed sections). Model must choose 1–4 from this set.
+AI_TAG_VOCABULARY = frozenset({
+    "date-night", "groups", "solo", "quick-bite", "healthy",
+    "coffee", "dessert", "study-spot", "fancy", "budget",
+})
+
 SYSTEM_PROMPT = """You are PickRight, an AI guide that summarizes a SINGLE local business. You never make things up that contradict the data you are given. You write in a friendly, concise tone. Do not personalize to any specific user; describe the place objectively.
 
-You are given structured data about the business (name, category, rating, price, address, and a few review snippets). Your task is to produce TWO things in a single JSON object:
+You are given structured data about the business (name, category, rating, price, address, and a few review snippets). Your task is to produce a single JSON object with exactly these three top-level keys:
 
 1. "notes": One or two short paragraphs of natural-language insight about this place (what people like, vibe, best situations to come here, stand-out items, dietary notes if present). Keep it concise.
 
@@ -32,8 +38,12 @@ You are given structured data about the business (name, category, rating, price,
    - "reliability_notes": string — How reliable the info is (e.g. "Based on Google reviews and place details").
    - "source_notes": string — Brief note on what sources were used (e.g. "Google Place details and reviews").
 
+3. "tags": An array of 1–4 tags from this exact vocabulary only (use the string values as-is):
+   date-night | groups | solo | quick-bite | healthy | coffee | dessert | study-spot | fancy | budget
+   Only include tags that clearly fit the business based on reviews, rating, price level, and description. No other values.
+
 Output ONLY valid JSON in this exact shape (no markdown, no code fence, no explanation):
-{"notes": "...", "context": {"summary": "...", "vibe": "...", "best_for": [], "pros": [], "cons": [], "reliability_notes": "...", "source_notes": "..."}}"""
+{"notes": "...", "context": {"summary": "...", "vibe": "...", "best_for": [], "pros": [], "cons": [], "reliability_notes": "...", "source_notes": "..."}, "tags": ["tag1", "tag2"]}"""
 
 
 def _format_review_snippets(place_data: dict, max_reviews: int = 3, max_chars_per_review: int = 300) -> str:
@@ -85,7 +95,7 @@ Tags: {tags}
 Sample review snippets (truncated):
 {review_snippets}
 
-Respond with a single JSON object only: {{"notes": "...", "context": {{...}}}}."""
+Respond with a single JSON object only: {{"notes": "...", "context": {{...}}, "tags": [...]}}."""
 
 
 def _parse_json_from_response(text: str) -> dict[str, Any]:
@@ -128,17 +138,29 @@ def _normalize_context_for_store(context: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in raw.items() if k in BusinessAIContext.model_fields}
 
 
-def generate_business_ai_insights(business: Business, place_details: dict) -> tuple[str, dict]:
+def _normalize_tags(raw_tags: Any) -> list[str]:
+    """Extract and validate tags: must be from vocabulary, max 4. Invalid entries are skipped."""
+    if not isinstance(raw_tags, list):
+        return []
+    out: list[str] = []
+    for item in raw_tags[:4]:
+        if isinstance(item, str) and item.strip() in AI_TAG_VOCABULARY:
+            out.append(item.strip())
+    return out
+
+
+def generate_business_ai_insights(business: Business, place_details: dict) -> tuple[str, dict, list[str]]:
     """
-    Call Gemini once and return both ai_notes and ai_context.
+    Call Gemini once and return ai_notes, ai_context, and ai_tags.
 
     Args:
         business: SQLAlchemy Business model (name, address, category, etc.).
         place_details: Raw Google Place Details API result (rating, reviews, types, etc.).
 
     Returns:
-        (ai_notes_string, ai_context_dict). ai_context_dict is JSON-serializable
-        and suitable for Business.ai_context (BusinessAIContext shape).
+        (ai_notes_string, ai_context_dict, ai_tags_list). ai_context_dict is JSON-serializable
+        and suitable for Business.ai_context (BusinessAIContext shape). ai_tags_list is
+        1–4 tags from the fixed vocabulary; defaults to [] if missing or invalid.
 
     Raises:
         RuntimeError: If the LLM returns nothing or JSON parsing fails and we have no fallback.
@@ -148,6 +170,7 @@ def generate_business_ai_insights(business: Business, place_details: dict) -> tu
         "summary": "AI context could not be generated.",
         "source_notes": "Generation failed.",
     }
+    fallback_tags: list[str] = []
 
     prompt = _build_prompt(business, place_details)
     try:
@@ -158,19 +181,21 @@ def generate_business_ai_insights(business: Business, place_details: dict) -> tu
 
     if not response_text or not response_text.strip():
         logger.warning("Empty Gemini response for business %s; returning fallback", business.id)
-        return (fallback_notes, fallback_context)
+        return (fallback_notes, fallback_context, fallback_tags)
 
     data = _parse_json_from_response(response_text)
     if not data:
         logger.warning("Could not parse AI insights JSON for business %s; returning fallback", business.id)
-        return (fallback_notes, fallback_context)
+        return (fallback_notes, fallback_context, fallback_tags)
 
     notes = (data.get("notes") or "").strip() or fallback_notes
     context_raw = data.get("context")
-    if not isinstance(context_raw, dict):
-        return (notes, fallback_context)
-    ai_context = _normalize_context_for_store(context_raw)
-    return (notes, ai_context)
+    ai_context = _normalize_context_for_store(context_raw) if isinstance(context_raw, dict) else fallback_context
+    raw_tags = data.get("tags")
+    tags = _normalize_tags(raw_tags) if raw_tags is not None else fallback_tags
+    if raw_tags is not None and not isinstance(raw_tags, list):
+        logger.debug("AI insights tags not a list for business %s; using empty list", business.id)
+    return (notes, ai_context, tags)
 
 
 def generate_and_save_business_ai_insights(business_id: UUID, place_details: dict) -> None:
@@ -210,9 +235,10 @@ def generate_and_save_business_ai_insights(business_id: UUID, place_details: dic
             logger.debug("generate_and_save_business_ai_insights: business %s already has fresh AI insights", business_id)
             return
 
-        ai_notes, ai_context = generate_business_ai_insights(business, place_details)
+        ai_notes, ai_context, ai_tags = generate_business_ai_insights(business, place_details)
         business.ai_notes = ai_notes
         business.ai_context = ai_context
+        business.ai_tags = ai_tags
         business.ai_context_last_updated = now
         db.commit()
         logger.info("Saved AI insights for business %s", business_id)
